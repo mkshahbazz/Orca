@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-dotenv
+openai
+langgraph
+langchain-core
+langchain-openai
+asyncpg
+pgvector
+supabase
+httpx
+shapely
+geojson
