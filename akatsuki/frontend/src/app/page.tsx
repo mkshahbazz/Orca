@@ -9,7 +9,7 @@ const MapView = dynamic(() => import("@/components/MapView"), {
   loading: () => <div className="h-full w-full animate-pulse bg-sky-200" />,
 });
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export interface ChatMessage {
   role: "user" | "assistant";
