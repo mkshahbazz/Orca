@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { Loader2, Send, Ship } from "lucide-react";
-import type { ChatMessage } from "@/app/page";
+import type { ChatMessage } from "@/app/app/page";
 
 const QUICK_PROMPTS = [
   "Weather and waves near Chennai coast right now?",
