@@ -1,6 +1,7 @@
 
+ 
 @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap");
-
+ 
 :root {
   font-family: "Inter", system-ui, sans-serif;
   color: #eef6ff;
@@ -25,7 +26,7 @@ button, input, select { font: inherit; }
 button { color: inherit; }
 button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #42a8ff; outline-offset: 2px; }
 button { cursor: pointer; }
-
+ 
 /* ---------- LANDING ---------- */
 .landing-page {
   position: relative;
@@ -36,9 +37,9 @@ button { cursor: pointer; }
   background: #020914;
   touch-action: pan-y;
 }
-
+ 
 .landing-nav { display: none; }
-
+ 
 .hero {
   position: relative;
   width: 100%;
@@ -53,7 +54,7 @@ button { cursor: pointer; }
   --my: 0px;
   --proximity: 0;
 }
-
+ 
 /* Cleaned 16:9 environmental base: the baked-in title/assistant from the
    source artwork is removed, leaving room for the live React UI. */
 .hero-bg {
@@ -66,7 +67,7 @@ button { cursor: pointer; }
   filter: saturate(.9) contrast(1.03) brightness(.9);
   will-change: transform;
 }
-
+ 
 /* The crisp central scene remains visible while the dark sides support the
    copy and assistant without making the monk oversized. */
 .hero-bg::before {
@@ -77,7 +78,7 @@ button { cursor: pointer; }
     linear-gradient(90deg, rgba(1,8,18,.88) 0%, rgba(1,8,18,.38) 20%, transparent 38%, transparent 62%, rgba(1,8,18,.34) 80%, rgba(1,8,18,.86) 100%),
     linear-gradient(180deg, rgba(1,8,18,.2), transparent 25%, transparent 72%, rgba(1,8,18,.58));
 }
-
+ 
 .hero-atmosphere {
   position: absolute;
   inset: -10%;
@@ -89,7 +90,7 @@ button { cursor: pointer; }
     linear-gradient(180deg, rgba(0,7,17,.08), rgba(0,8,18,.22));
   mix-blend-mode: screen;
 }
-
+ 
 .hero-vignette {
   position: absolute;
   inset: 0;
@@ -99,7 +100,7 @@ button { cursor: pointer; }
     radial-gradient(circle at 50% 43%, transparent 0 25%, rgba(1,8,18,.06) 45%, rgba(1,8,18,.32) 100%),
     linear-gradient(90deg, rgba(1,8,18,.28), transparent 30%, transparent 70%, rgba(1,8,18,.28));
 }
-
+ 
 .hero-copy {
   position: relative;
   z-index: 5;
@@ -109,14 +110,14 @@ button { cursor: pointer; }
   margin-top: -1vh;
   animation: heroCopyIn .8s ease both;
 }
-
+ 
 .eyebrow {
   color: #a4c8ee;
   font-size: 11px;
   letter-spacing: .28em;
   margin: 0 0 20px;
 }
-
+ 
 .hero-copy h1 {
   margin: 0;
   font-size: clamp(68px, 7.4vw, 112px);
@@ -124,9 +125,9 @@ button { cursor: pointer; }
   letter-spacing: -.07em;
   font-weight: 800;
 }
-
+ 
 .hero-copy h1 span { color: #2c8be9; }
-
+ 
 .hero-description {
   color: #c3d6eb;
   font-size: 15px;
@@ -134,7 +135,7 @@ button { cursor: pointer; }
   max-width: 420px;
   margin: 30px 0 0;
 }
-
+ 
 .primary-cta {
   display: flex;
   align-items: center;
@@ -148,7 +149,7 @@ button { cursor: pointer; }
   font-weight: 600;
   transition: transform .25s ease, box-shadow .25s ease;
 }
-
+ 
 .primary-cta span {
   width: 40px;
   height: 40px;
@@ -157,12 +158,12 @@ button { cursor: pointer; }
   place-items: center;
   background: #1675e6;
 }
-
+ 
 .primary-cta:hover {
   transform: translateY(-2px) scale(1.015);
   box-shadow: 0 0 38px rgba(22,120,255,.42);
 }
-
+ 
 .hero-assistant-preview {
   position: absolute;
   z-index: 6;
@@ -177,7 +178,7 @@ button { cursor: pointer; }
   box-shadow: 0 24px 70px rgba(0,0,0,.3);
   animation: assistantIn .9s .15s ease both;
 }
-
+ 
 .preview-head { display: flex; align-items: center; gap: 11px; }
 .preview-head > svg { margin-left: auto; color: #7da3ce; }
 .preview-avatar {
@@ -247,7 +248,7 @@ button { cursor: pointer; }
   color: white;
   margin-top: -5px;
 }
-
+ 
 /* Breathing meditation energy field. The source art already has a halo;
    these live rings create the slow expanding radar-like pulse requested. */
 .meditation-ring {
@@ -267,7 +268,7 @@ button { cursor: pointer; }
 }
 .ring-two { animation-delay: -2.8s; }
 .ring-three { animation-delay: -5.6s; }
-
+ 
 .monk-focus {
   position: absolute;
   z-index: 2;
@@ -283,7 +284,7 @@ button { cursor: pointer; }
   opacity: calc(.55 + var(--proximity) * .35);
   pointer-events: none;
 }
-
+ 
 /* Wind-driven ribbon overlays. They stay extremely subtle so the original
    artwork remains the star of the scene. */
 .fabric-stream {
@@ -320,7 +321,7 @@ button { cursor: pointer; }
   clip-path: polygon(0 43%, 22% 18%, 46% 39%, 68% 15%, 100% 47%, 78% 70%, 50% 54%, 25% 80%);
   animation: fabricFlowLower 8.4s .5s ease-in-out infinite;
 }
-
+ 
 /* Occasional side-water disturbances. These are deliberately away from the
    monk and use long, slow cycles so the ocean never feels mechanical. */
 .wave-surge {
@@ -357,7 +358,7 @@ button { cursor: pointer; }
   animation: oceanBreath 9s ease-in-out infinite;
   pointer-events: none;
 }
-
+ 
 .swipe-hint {
   position: absolute;
   z-index: 7;
@@ -376,7 +377,7 @@ button { cursor: pointer; }
   backdrop-filter: blur(8px);
   animation: swipeBob 2.1s ease-in-out infinite;
 }
-
+ 
 @keyframes meditationPulse {
   0% { transform: translate(-50%,-50%) scale(.58); opacity: .05; }
   18% { opacity: .45; }
@@ -421,14 +422,14 @@ button { cursor: pointer; }
   from { opacity: 0; transform: translateX(20px); }
   to { opacity: 1; transform: translateX(0); }
 }
-
+ 
 @media (max-width: 1100px) {
   .hero { padding-left: 4vw; padding-right: 4vw; }
   .hero-copy { width: 34vw; }
   .hero-assistant-preview { width: 27vw; right: 2vw; }
   .hero-description { font-size: 13px; }
 }
-
+ 
 @media (max-width: 760px) {
   .landing-page, .hero { min-height: 100svh; }
   .hero {
@@ -460,10 +461,11 @@ button { cursor: pointer; }
   .fabric-right { right: 13%; top: 48%; width: 25vw; }
   .fabric-lower { left: 28%; width: 42vw; }
 }
-
+ 
 @media (prefers-reduced-motion: reduce) {
   .hero-bg, .hero-copy, .hero-assistant-preview, .swipe-hint,
   .meditation-ring, .fabric-stream, .wave-surge, .wave-shimmer {
     animation: none;
   }
   .hero-bg { transition: none; }
+}
