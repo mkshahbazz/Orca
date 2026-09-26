@@ -18,7 +18,16 @@ async def init_pool() -> None:
     if _pool is None:
         if not settings.database_url:
             raise RuntimeError("DATABASE_URL is not set in backend/.env")
-        _pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=5)
+        # min 2 warm connections; statement cache off for pgbouncer/Supabase
+        # transaction pooling (asyncpg otherwise caches prepared statements
+        # per connection, which pgbouncer reassigns between transactions).
+        _pool = await asyncpg.create_pool(
+            settings.database_url,
+            min_size=2,
+            max_size=10,
+            command_timeout=15,
+            statement_cache_size=0,
+        )
 
 
 async def close_pool() -> None:

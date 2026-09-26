@@ -104,3 +104,10 @@ $$;
 
 -- Sanity check: this must return the cyclone row
 -- select * from public.check_hazard_zone(16.0, 86.5);
+
+-- 7) Performance indexes (optimization pass) ----------------------------
+-- PFZ bulletin query filters on valid_until and sorts by chlorophyll.
+create index if not exists pfz_zones_valid_until_idx on public.pfz_zones (valid_until);
+create index if not exists pfz_zones_chlorophyll_idx on public.pfz_zones (chlorophyll desc);
+-- user_queries grows unbounded; keep recent-first lookups/cleanup fast.
+create index if not exists user_queries_created_at_idx on public.user_queries (created_at desc);

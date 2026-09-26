@@ -1,5 +1,6 @@
 """OpenAI client: gpt-4o (chat/JSON) + text-embedding-3-small (RAG)."""
 import json
+from collections.abc import AsyncIterator
 
 from openai import AsyncOpenAI
 
@@ -43,3 +44,20 @@ async def chat_markdown(system: str, user: str) -> str:
         ],
     )
     return resp.choices[0].message.content or ""
+
+
+async def chat_markdown_stream(system: str, user: str) -> AsyncIterator[str]:
+    """Streaming variant of chat_markdown — yields tokens as they arrive
+    so callers can push them to clients (lower time-to-first-byte)."""
+    stream = await _client.chat.completions.create(
+        model=CHAT_MODEL,
+        temperature=0.3,
+        stream=True,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    )
+    async for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content

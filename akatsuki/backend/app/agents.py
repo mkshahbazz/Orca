@@ -7,13 +7,14 @@ Flow: START -> router (LLM intent classification)
 No cycles: termination is guaranteed. Each worker writes ONE distinct state key,
 so parallel branches never conflict.
 """
+import asyncio
 import re
-from typing import Any, TypedDict
+from typing import Any, AsyncIterator, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from app.llm import chat_json, chat_markdown
+from app.llm import chat_json, chat_markdown, chat_markdown_stream
 from app.services import advisory, geospatial, incois, weather
 
 # ---------------------------------------------------------------- state
@@ -184,25 +185,99 @@ async def synthesize_node(state: AgentState) -> dict:
     try:
         response = await chat_markdown(SYNTH_SYS, _context(state))
     except Exception:
-        g = state.get("geospatial_data") or {}
-        zones = g.get("zones") or []
-        lines = []
-        if zones:
-            for z in zones:
-                lines.append(f"⚠️ **{z['name']}** (severity: {z['severity']}) — {z['advisory']}")
-            lines.append("**Recommendation: DO NOT proceed to this location.**")
-        else:
-            lines.append("✅ No active hazard zone was found at the given coordinates.")
-        w = state.get("weather_data") or {}
-        if w:
-            lines.append(f"\n🌊 Marine conditions: {w.get('weather')}, wave height {w.get('wave_height_m')} m, "
-                         f"wind {w.get('wind_speed_kmh')} km/h (gust {w.get('wind_gusts_kmh')} km/h), "
-                         f"SST {w.get('sea_surface_temperature_c')} °C — *{w.get('source')}*.")
-        p = state.get("pfz_data")
-        if p and p.get("zone_count"):
-            lines.append(f"\n🎣 {p['zone_count']} active PFZ zone(s) shown in green — *{p['source']}*.")
-        response = "\n\n".join(lines)
+        response = _fallback_answer(state)
+    # Trimmed payload: the big geojson blobs are already merged into
+    # map_features, so drop the per-worker duplicates from the state.
     return {"response": response, "map_features": map_features}
+
+
+def _fallback_answer(state: AgentState) -> str:
+    """Deterministic markdown used when the synthesis LLM call fails."""
+    g = state.get("geospatial_data") or {}
+    zones = g.get("zones") or []
+    lines = []
+    if zones:
+        for z in zones:
+            lines.append(f"⚠️ **{z['name']}** (severity: {z['severity']}) — {z['advisory']}")
+        lines.append("**Recommendation: DO NOT proceed to this location.**")
+    else:
+        lines.append("✅ No active hazard zone was found at the given coordinates.")
+    w = state.get("weather_data") or {}
+    if w:
+        lines.append(f"\n🌊 Marine conditions: {w.get('weather')}, wave height {w.get('wave_height_m')} m, "
+                     f"wind {w.get('wind_speed_kmh')} km/h (gust {w.get('wind_gusts_kmh')} km/h), "
+                     f"SST {w.get('sea_surface_temperature_c')} °C — *{w.get('source')}*.")
+    p = state.get("pfz_data")
+    if p and p.get("zone_count"):
+        lines.append(f"\n🎣 {p['zone_count']} active PFZ zone(s) shown in green — *{p['source']}*.")
+    return "\n\n".join(lines)
+
+
+async def synthesize_stream_node(state: AgentState):
+    """Streaming twin of synthesize_node for SSE.
+
+    Yields ('__token__', str) chunks as the LLM generates, then a final
+    ('result', dict) state update. Keeps the fallback path identical to the
+    non-streaming node.
+    """
+    map_features = _merge_features(state)
+    response = ""
+    try:
+        async for token in chat_markdown_stream(SYNTH_SYS, _context(state)):
+            response += token
+            yield ("__token__", token)
+    except Exception:
+        response = _fallback_answer(state)
+        yield ("__token__", response)
+    yield "result", {"response": response, "map_features": map_features}
+
+
+# ---------------------------------------------------------------- streaming
+_STREAM_NODE_MAP = {
+    "weather": weather_node,
+    "geospatial": geospatial_node,
+    "pfz": pfz_node,
+    "advisory": advisory_node,
+}
+
+
+async def run_chat_stream(message: str) -> AsyncIterator[tuple[str, dict | str]]:
+    """SSE-friendly orchestration mirroring the LangGraph DAG (same nodes).
+
+    Yields ("status", {...}) milestones, ("token", str) synthesis tokens as
+    they are generated, and finally ("final", {...}) with the complete
+    trimmed result. The parallel fan-out to MOSDAC/Open-Meteo, PostGIS and
+    the advisory RAG runs concurrently via asyncio.as_completed.
+    """
+    state: AgentState = {"message": message}
+
+    state.update(await router_node(state))
+    yield "status", {"stage": "routed", "intent": state.get("intent")}
+
+    tasks = TASK_MAP.get(state.get("intent"), ["advisory"])
+    payload = {k: state.get(k) for k in ("message", "intent", "coordinates")}
+
+    async def _run(name: str):
+        return name, await _STREAM_NODE_MAP[name](payload)
+
+    for coro in asyncio.as_completed([_run(t) for t in tasks]):
+        name, delta = await coro
+        state.update(delta)
+        yield "status", {"stage": f"{name}_ready"}
+
+    async for kind, chunk in synthesize_stream_node(state):
+        if kind == "__token__":
+            yield "token", chunk
+        else:
+            state.update(chunk)
+
+    yield "final", {
+        "response": state.get("response", ""),
+        "map_features": state.get("map_features")
+        or {"type": "FeatureCollection", "features": []},
+        "intent": state.get("intent") or "general_advisory",
+        "coordinates": state.get("coordinates"),
+    }
 
 # ---------------------------------------------------------------- graph
 def build_graph():
