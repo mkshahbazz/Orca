@@ -24,7 +24,8 @@ from supabase import create_client
 
 from app.agents import graph, run_chat_stream
 from app.config import settings
-from app.services import geospatial, weather
+from app.dashboard import router as dashboard_router
+from app.services import bhashini, geospatial, weather
 
 log = logging.getLogger("marine")
 
@@ -50,6 +51,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Marine Geospatial Safety & Fishing Advisory", lifespan=lifespan)
+app.include_router(dashboard_router)  # additive read-only dashboard endpoints
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins.split(","),
@@ -60,12 +62,17 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
+    # Optional Bhashini ISO-639 code (hi/bn/ta/...). "en" (default) returns
+    # the answer in English exactly as before — existing clients unaffected.
+    language: str | None = None
 
 
 class ChatResponse(BaseModel):
     response: str
     map_features: dict
     intent: str
+    # "en" when no translation was requested; target code otherwise
+    language: str = "en"
 
 
 EMPTY_FC = {"type": "FeatureCollection", "features": []}
@@ -104,17 +111,21 @@ async def chat(req: ChatRequest):
     async for kind, payload in run_chat_stream(req.message):
         if kind == "final":
             final = payload
+    answer = final.get("response", "")
+    if req.language and req.language != "en":
+        answer = await bhashini.translate(answer, "en", req.language)
     _spawn_log_query({
         "query_text": req.message,
         "intent": final.get("intent"),
         "coordinates": final.get("coordinates"),
-        "response_text": final.get("response"),
+        "response_text": answer,
         "map_features": final.get("map_features"),
     })
     return ChatResponse(
-        response=final.get("response", ""),
+        response=answer,
         map_features=final.get("map_features") or EMPTY_FC,
         intent=final.get("intent") or "general_advisory",
+        language=req.language if (req.language and req.language != "en") else "en",
     )
 
 
@@ -125,18 +136,25 @@ async def chat_stream(req: ChatRequest):
     async def event_stream():
         final: dict = {}
         try:
+            translated: str | None = None
             async for kind, payload in run_chat_stream(req.message):
                 if kind == "final":
                     final = payload
+                    answer = payload.get("response", "")
+                    if req.language and req.language != "en":
+                        answer = await bhashini.translate(answer, "en", req.language)
+                        translated = answer
                     # trimmed wire payload — internals (coordinates etc.)
                     # stay server-side; the UI only needs these three keys
                     wire = {
-                        "response": payload.get("response", ""),
+                        "response": answer,
                         "map_features": payload.get("map_features") or EMPTY_FC,
                         "intent": payload.get("intent") or "general_advisory",
+                        "language": (req.language or "en") if translated is not None else "en",
                     }
                 elif kind == "token":
-                    wire = payload
+                    # once translation is known it replaces the streamed English
+                    wire = payload if translated is None else ""
                 else:
                     wire = payload
                 yield f"event: {kind}\ndata: {json.dumps(wire)}\n\n"
