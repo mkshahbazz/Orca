@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useState } from "react";
 import dynamic from "next/dynamic";
 import ChatDrawer from "@/components/ChatDrawer";
 
@@ -11,9 +11,19 @@ const MapView = dynamic(() => import("@/components/MapView"), {
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+/** Self-assessment shipped out-of-band of the streamed answer text. */
+export interface Confidence {
+  score: number;
+  label: "high" | "moderate" | "low";
+  justification: string;
+  factors?: string[];
+}
+
 export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
+  confidence?: Confidence | null;
+  error?: boolean;
 }
 
 interface MapFeatureCollection {
@@ -24,39 +34,54 @@ interface MapFeatureCollection {
 export default function MarineChatApp() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState("");
+  const [language, setLanguage] = useState("en");
   const [mapFeatures, setMapFeatures] = useState<MapFeatureCollection | null>(
     null
   );
   const [mapVersion, setMapVersion] = useState(0);
-  const streamFailed = useRef(false); // fall back to JSON after a stream error
 
-  const appendAssistant = useCallback((content: string) => {
-    setMessages((m) => [...m, { role: "assistant", content }]);
-  }, []);
+  const appendAssistant = useCallback(
+    (content: string, error = false) => {
+      setMessages((m) => [...m, { role: "assistant", content, error }]);
+    },
+    []
+  );
 
   const sendMessage = useCallback(
-    async (text: string) => {
+    async (text: string, lang: string = "en") => {
       setMessages((m) => [...m, { role: "user", content: text }]);
       setLoading(true);
+      setStatus("Contacting the marine intelligence service…");
 
       // placeholder bubble we stream into
       const placeholder = "\u2026";
       setMessages((m) => [...m, { role: "assistant", content: placeholder }]);
-      const updateLast = (content: string) =>
+      const updateLast = (
+        content: string,
+        confidence?: Confidence | null,
+        error = false
+      ) =>
         setMessages((m) => {
           const next = [...m];
-          next[next.length - 1] = { role: "assistant", content };
+          next[next.length - 1] = {
+            role: "assistant",
+            content,
+            confidence: confidence ?? next[next.length - 1]?.confidence ?? null,
+            error,
+          };
           return next;
         });
 
       let streamed = "";
       let features: MapFeatureCollection | null = null;
+      let serverError: string | null = null;
+      let confidence: Confidence | null = null;
 
       const consumeSse = async (res: Response) => {
         const reader = res.body!.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
-        let intent = "";
 
         const handleEvent = (event: string, raw: string) => {
           if (!raw) return;
@@ -69,13 +94,22 @@ export default function MarineChatApp() {
           if (event === "token" && typeof data === "string") {
             streamed += data;
             updateLast(streamed);
+          } else if (event === "status" && data) {
+            // live transparency: show exactly what the backend is doing
+            if (data.label) setStatus(data.label);
           } else if (event === "final" && data) {
-            if (data.response && !streamed) updateLast(data.response);
+            if (data.confidence) confidence = data.confidence;
+            if (data.response && !streamed) {
+              // translated answers arrive whole (English tokens are withheld)
+              updateLast(data.response, confidence);
+            } else {
+              updateLast(streamed || data.response || "", confidence);
+            }
             if (data.map_features?.features?.length)
               features = data.map_features;
-            intent = data.intent || intent;
           } else if (event === "error" && data?.message) {
-            throw new Error(data.message);
+            // genuine failure from the backend — never masked with fake data
+            serverError = data.message;
           }
         };
 
@@ -96,24 +130,40 @@ export default function MarineChatApp() {
             handleEvent(event, dataLines.join("\n"));
           }
         }
-        return intent;
+      };
+
+      const showError = (message: string, partial = "") => {
+        const body = `⚠️ **Service unavailable:** ${message}`;
+        updateLast(partial ? `${partial}\n\n${body}` : body, null, true);
       };
 
       try {
         const res = await fetch(`${API_URL}/api/chat/stream`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: text }),
+          body: JSON.stringify({ message: text, language: lang }),
         });
 
-        if (res.ok && res.body && res.headers.get("content-type")?.includes("text/event-stream")) {
+        if (!res.ok) {
+          // the backend refuses with a real reason — surface it, never mask it
+          const body = await res.json().catch(() => null);
+          showError(body?.detail || `backend returned ${res.status}`, streamed);
+          return;
+        }
+
+        if (res.body && res.headers.get("content-type")?.includes("text/event-stream")) {
           await consumeSse(res);
         } else {
-          // non-streaming fallback (older backend, proxies, unexpected payload)
+          // non-streaming payload (older backend, proxies, unexpected body)
           const data = await res.json();
-          updateLast(data.response ?? "");
+          updateLast(data.response ?? "", data.confidence ?? null);
           if (data.map_features?.features?.length)
             features = data.map_features;
+        }
+
+        if (serverError) {
+          showError(serverError, streamed);
+          return;
         }
 
         if (features) {
@@ -122,29 +172,32 @@ export default function MarineChatApp() {
         }
       } catch (err: any) {
         if (!streamed) {
-          // stream never produced anything — retry once over plain JSON
+          // transport-level failure — retry once over plain JSON
           try {
             const res = await fetch(`${API_URL}/api/chat`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: text }),
+              body: JSON.stringify({ message: text, language: lang }),
             });
-            if (!res.ok) throw new Error(`Backend ${res.status}`);
+            if (!res.ok) {
+              const body = await res.json().catch(() => null);
+              throw new Error(body?.detail || `Backend ${res.status}`);
+            }
             const data = await res.json();
-            updateLast(data.response);
+            updateLast(data.response, data.confidence ?? null);
             if (data.map_features?.features?.length) {
               setMapFeatures(data.map_features);
               setMapVersion((v) => v + 1);
             }
           } catch (err2: any) {
-            appendAssistant(`⚠️ **Error:** ${err2.message}`);
+            appendAssistant(`⚠️ **Service unavailable:** ${err2.message}`, true);
           }
         } else {
-          appendAssistant(`⚠️ **Stream interrupted:** ${err.message}`);
+          appendAssistant(`⚠️ **Answer interrupted:** ${err.message}`, true);
         }
       } finally {
+        setStatus("");
         setLoading(false);
-        streamFailed.current = false;
       }
     },
     [appendAssistant]
@@ -153,7 +206,14 @@ export default function MarineChatApp() {
   return (
     <main className="relative h-screen w-screen overflow-hidden">
       <MapView mapFeatures={mapFeatures} refreshKey={mapVersion} />
-      <ChatDrawer messages={messages} loading={loading} onSend={sendMessage} />
+      <ChatDrawer
+        messages={messages}
+        loading={loading}
+        status={status}
+        language={language}
+        onLanguageChange={setLanguage}
+        onSend={sendMessage}
+      />
     </main>
   );
 }

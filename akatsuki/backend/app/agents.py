@@ -2,10 +2,16 @@
 
 Flow: START -> router (LLM intent classification)
            -> conditional edge returns [Send(...)] -> parallel specialist nodes
+           -> verify (community corroboration + confidence scoring)
            -> synthesize (gpt-4o markdown) -> END
 
 No cycles: termination is guaranteed. Each worker writes ONE distinct state key,
 so parallel branches never conflict.
+
+Two payloads leave this module and they never touch each other:
+  * `response`   — the conversational markdown, streamed token-by-token;
+  * `confidence` — the self-assessment (score + one-line justification) which is
+    returned as a separate field so it cannot interrupt the typing stream.
 """
 import asyncio
 import re
@@ -15,7 +21,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 from app.llm import chat_json, chat_markdown, chat_markdown_stream
-from app.services import advisory, geospatial, incois, weather
+from app.services import advisory, community, confidence, geospatial, incois, weather
 
 # ---------------------------------------------------------------- state
 class AgentState(TypedDict, total=False):
@@ -26,6 +32,8 @@ class AgentState(TypedDict, total=False):
     geospatial_data: dict[str, Any] | None
     pfz_data: dict[str, Any] | None
     advisory_data: dict[str, Any] | None
+    community_data: dict[str, Any] | None
+    confidence: dict[str, Any] | None
     map_features: dict[str, Any] | None
     response: str
 
@@ -33,10 +41,22 @@ INTENTS = ("weather", "pfz_search", "hazard_check", "general_advisory")
 
 # intent -> workers to fan out to (every intent maps to >= 1 worker)
 TASK_MAP = {
-    "weather":        ["weather"],
-    "pfz_search":     ["pfz", "advisory"],
-    "hazard_check":   ["geospatial", "weather", "advisory"],
+    "weather":        ["weather", "community"],
+    "pfz_search":     ["pfz", "advisory", "community"],
+    "hazard_check":   ["geospatial", "weather", "advisory", "community"],
     "general_advisory": ["advisory"],
+}
+
+# Human-readable milestones the UI shows while it waits (live status transparency).
+STATUS_LABELS = {
+    "routed": "Understanding your question…",
+    "weather": "Checking weather buoys…",
+    "geospatial": "Checking hazard zones…",
+    "pfz": "Fetching the PFZ bulletin…",
+    "advisory": "Searching safety advisories…",
+    "community": "Scanning community reports…",
+    "verifying": "Cross-checking human reports against live sensors…",
+    "synthesizing": "Writing safety report…",
 }
 
 _COORD_RE = re.compile(
@@ -73,6 +93,8 @@ async def router_node(state: AgentState) -> dict:
         if out.get("lat") is not None and out.get("lon") is not None:
             coords = {"lat": float(out["lat"]), "lon": float(out["lon"])}
     except Exception:
+        # Deterministic keyword parsing — not fabricated data, just a fallback
+        # classifier when the router LLM is unreachable.
         msg = state["message"].lower()
         if "pfz" in msg or "fish zone" in msg or "chlorophyll" in msg:
             intent = "pfz_search"
@@ -96,6 +118,7 @@ def route_workers(state: AgentState) -> list[Send]:
         "geospatial": "geospatial_node",
         "pfz": "pfz_node",
         "advisory": "advisory_node",
+        "community": "community_node",
     }
     return [Send(node_map[t], payload) for t in tasks]
 
@@ -137,6 +160,35 @@ async def advisory_node(state: AgentState) -> dict:
         matches = [{"note": f"advisory RAG unavailable: {exc}"}]
     return {"advisory_data": {"matches": matches}}
 
+
+async def community_node(state: AgentState) -> dict:
+    """Pull crowdsourced reports near the queried location (never verified here:
+    verification happens once weather data is in hand, in verify_node)."""
+    c = state.get("coordinates")
+    if not c:
+        return {"community_data": {"reports": [], "searched": False}}
+    reports = await community.find_nearby_reports(c["lat"], c["lon"])
+    return {"community_data": {
+        "reports": reports, "searched": True, "lat": c["lat"], "lon": c["lon"],
+    }}
+
+# ---------------------------------------------------------------- verification
+async def verify_node(state: AgentState) -> dict:
+    """Verification matrix + confidence scoring.
+
+    Human tips are cross-referenced with the physical sensor readings gathered
+    by the parallel workers; only sensor-corroborated reports are allowed to
+    lift the final confidence score.
+    """
+    cd = state.get("community_data") or {}
+    reports = community.verify_reports(cd.get("reports") or [], state.get("weather_data"))
+    verified = [r for r in reports if r.get("verified")]
+    scored = confidence.score_answer(state, verified_reports=verified)
+    return {
+        "community_data": {**cd, "reports": reports, "verified_count": len(verified)},
+        "confidence": scored,
+    }
+
 # ---------------------------------------------------------------- synthesizer
 SYNTH_SYS = (
     "You are a marine safety officer writing for fishermen and coastal authorities. "
@@ -144,7 +196,8 @@ SYNTH_SYS = (
     "advisory knowledge base). If a hazard zone hit is reported you MUST lead with a "
     "prominent ⚠️ warning and a strict DO-NOT recommendation. Never invent numbers — "
     "use only the data provided. Keep it under ~180 words. Always end with a short "
-    "'🛰️ Map' line describing what was drawn (red = hazard, green = PFZ)."
+    "'🛰️ Map' line describing what was drawn (red = hazard, green = PFZ, cyan/amber = "
+    "community report pins)."
 )
 
 
@@ -152,10 +205,13 @@ def _merge_features(state: AgentState) -> dict:
     features: list[dict] = []
     gd = (state.get("geospatial_data") or {}).get("geojson")
     pd = (state.get("pfz_data") or {}).get("geojson")
+    cd = (state.get("community_data") or {}).get("reports")
     if gd:
         features += gd["features"]
     if pd:
         features += pd["features"]
+    if cd:
+        features += community.to_geojson(cd)["features"]
     return {"type": "FeatureCollection", "features": features}
 
 
@@ -176,59 +232,38 @@ def _context(state: AgentState) -> str:
     a = state.get("advisory_data") or {}
     for m in (a.get("matches") or [])[:2]:
         parts.append(f"ADVISORY [{m.get('category')}] {m.get('title')}: {(m.get('content') or '')[:400]}")
+    cd = state.get("community_data") or {}
+    for r in (cd.get("reports") or [])[:4]:
+        trust = "VERIFIED" if r.get("verified") else "UNVERIFIED"
+        parts.append(
+            f"COMMUNITY [{trust}] {r.get('category')} by {r.get('reporter_role') or 'community'} "
+            f"at {r.get('lat'):.3f},{r.get('lon'):.3f} on {r.get('observed_at')}: "
+            f"{r.get('description')} — {r.get('verification_note')}"
+        )
     return "\n".join(parts)
 
 
 async def synthesize_node(state: AgentState) -> dict:
-    """gpt-4o markdown answer; deterministic fallback if the LLM call fails."""
+    """gpt-4o markdown answer. Provider failures propagate — never faked."""
     map_features = _merge_features(state)
-    try:
-        response = await chat_markdown(SYNTH_SYS, _context(state))
-    except Exception:
-        response = _fallback_answer(state)
+    response = await chat_markdown(SYNTH_SYS, _context(state))
     # Trimmed payload: the big geojson blobs are already merged into
     # map_features, so drop the per-worker duplicates from the state.
     return {"response": response, "map_features": map_features}
-
-
-def _fallback_answer(state: AgentState) -> str:
-    """Deterministic markdown used when the synthesis LLM call fails."""
-    g = state.get("geospatial_data") or {}
-    zones = g.get("zones") or []
-    lines = []
-    if zones:
-        for z in zones:
-            lines.append(f"⚠️ **{z['name']}** (severity: {z['severity']}) — {z['advisory']}")
-        lines.append("**Recommendation: DO NOT proceed to this location.**")
-    else:
-        lines.append("✅ No active hazard zone was found at the given coordinates.")
-    w = state.get("weather_data") or {}
-    if w:
-        lines.append(f"\n🌊 Marine conditions: {w.get('weather')}, wave height {w.get('wave_height_m')} m, "
-                     f"wind {w.get('wind_speed_kmh')} km/h (gust {w.get('wind_gusts_kmh')} km/h), "
-                     f"SST {w.get('sea_surface_temperature_c')} °C — *{w.get('source')}*.")
-    p = state.get("pfz_data")
-    if p and p.get("zone_count"):
-        lines.append(f"\n🎣 {p['zone_count']} active PFZ zone(s) shown in green — *{p['source']}*.")
-    return "\n\n".join(lines)
 
 
 async def synthesize_stream_node(state: AgentState):
     """Streaming twin of synthesize_node for SSE.
 
     Yields ('__token__', str) chunks as the LLM generates, then a final
-    ('result', dict) state update. Keeps the fallback path identical to the
-    non-streaming node.
+    ('result', dict) state update. Provider errors propagate to the caller so
+    the UI receives a genuine failure instead of a fabricated report.
     """
     map_features = _merge_features(state)
     response = ""
-    try:
-        async for token in chat_markdown_stream(SYNTH_SYS, _context(state)):
-            response += token
-            yield ("__token__", token)
-    except Exception:
-        response = _fallback_answer(state)
-        yield ("__token__", response)
+    async for token in chat_markdown_stream(SYNTH_SYS, _context(state)):
+        response += token
+        yield ("__token__", token)
     yield "result", {"response": response, "map_features": map_features}
 
 
@@ -238,21 +273,26 @@ _STREAM_NODE_MAP = {
     "geospatial": geospatial_node,
     "pfz": pfz_node,
     "advisory": advisory_node,
+    "community": community_node,
 }
+
+
+def _status(stage: str, **extra) -> tuple[str, dict]:
+    return "status", {"stage": stage, "label": STATUS_LABELS.get(stage, stage), **extra}
 
 
 async def run_chat_stream(message: str) -> AsyncIterator[tuple[str, dict | str]]:
     """SSE-friendly orchestration mirroring the LangGraph DAG (same nodes).
 
-    Yields ("status", {...}) milestones, ("token", str) synthesis tokens as
-    they are generated, and finally ("final", {...}) with the complete
-    trimmed result. The parallel fan-out to MOSDAC/Open-Meteo, PostGIS and
-    the advisory RAG runs concurrently via asyncio.as_completed.
+    Yields ("status", {...}) milestones with human-readable labels,
+    ("token", str) synthesis tokens as they are generated, and finally
+    ("final", {...}) with the complete trimmed result — including the
+    out-of-band `confidence` payload that must never enter the token stream.
     """
     state: AgentState = {"message": message}
 
     state.update(await router_node(state))
-    yield "status", {"stage": "routed", "intent": state.get("intent")}
+    yield _status("routed", intent=state.get("intent"))
 
     tasks = TASK_MAP.get(state.get("intent"), ["advisory"])
     payload = {k: state.get(k) for k in ("message", "intent", "coordinates")}
@@ -263,20 +303,31 @@ async def run_chat_stream(message: str) -> AsyncIterator[tuple[str, dict | str]]
     for coro in asyncio.as_completed([_run(t) for t in tasks]):
         name, delta = await coro
         state.update(delta)
-        yield "status", {"stage": f"{name}_ready"}
+        yield _status(name)
 
+    # Verification matrix + confidence scoring (out-of-band of the tokens).
+    yield _status("verifying")
+    state.update(await verify_node(state))
+
+    yield _status("synthesizing")
     async for kind, chunk in synthesize_stream_node(state):
         if kind == "__token__":
             yield "token", chunk
         else:
             state.update(chunk)
 
+    cd = state.get("community_data") or {}
     yield "final", {
         "response": state.get("response", ""),
         "map_features": state.get("map_features")
         or {"type": "FeatureCollection", "features": []},
         "intent": state.get("intent") or "general_advisory",
         "coordinates": state.get("coordinates"),
+        "confidence": state.get("confidence"),
+        "community": {
+            "count": len(cd.get("reports") or []),
+            "verified_count": cd.get("verified_count", 0),
+        },
     }
 
 # ---------------------------------------------------------------- graph
@@ -287,16 +338,19 @@ def build_graph():
     g.add_node("geospatial_node", geospatial_node)
     g.add_node("pfz_node", pfz_node)
     g.add_node("advisory_node", advisory_node)
+    g.add_node("community_node", community_node)
+    g.add_node("verify", verify_node)
     g.add_node("synthesize", synthesize_node)
 
     g.add_edge(START, "router")
-    # router -> parallel workers (Send fan-out); workers rejoin at synthesize
+    # router -> parallel workers (Send fan-out); workers rejoin at verify
     g.add_conditional_edges(
         "router", route_workers,
-        ["weather_node", "geospatial_node", "pfz_node", "advisory_node"],
+        ["weather_node", "geospatial_node", "pfz_node", "advisory_node", "community_node"],
     )
-    for w in ("weather_node", "geospatial_node", "pfz_node", "advisory_node"):
-        g.add_edge(w, "synthesize")
+    for w in ("weather_node", "geospatial_node", "pfz_node", "advisory_node", "community_node"):
+        g.add_edge(w, "verify")
+    g.add_edge("verify", "synthesize")
     g.add_edge("synthesize", END)
     return g.compile()
 

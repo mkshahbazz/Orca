@@ -69,7 +69,58 @@ insert into public.marine_advisories (title, category, content) values
 ('Maritime boundary caution', 'boundary',
  'Fishing across the international maritime boundary is a legal offence and can lead to vessel seizure and crew detention. Cross-check GPS position against the EEZ line before long trips.');
 
--- 4) Chat / query log ------------------------------------------------
+-- 4) Crowdsourced community reports ---------------------------------
+-- Tips from fishermen / coastal workers. Never trusted blindly: the backend
+-- cross-references each claim with live satellite + weather readings and only
+-- then sets `verified` (which is what feeds the confidence score).
+create table if not exists public.community_reports (
+    id                bigint generated always as identity primary key,
+    created_at        timestamptz not null default now(),
+    observed_at       timestamptz not null default now(),   -- when it happened
+    category          text not null check (category in (
+                          'heavy_swell','high_wave','rough_seas','high_wind',
+                          'squall','thunderstorm','storm','strong_current',
+                          'debris','oil_spill','shoal','fish_sighting','other')),
+    description       text not null,                        -- what was seen
+    reporter_role     text,                                 -- fisherman, coast_guard…
+    lat               double precision not null,
+    lon               double precision not null,
+    location          geometry(Point, 4326) not null,       -- where (X=lon, Y=lat)
+    verified          boolean not null default false,
+    verification_note text,
+    verification_source text
+);
+create index if not exists community_reports_geom_idx
+    on public.community_reports using gist (location);
+create index if not exists community_reports_observed_at_idx
+    on public.community_reports (observed_at desc);
+
+-- Keep `location` in sync with the lat/lon pair on every insert.
+create or replace function public.sync_community_location()
+returns trigger language plpgsql as $$
+begin
+    new.location := ST_SetSRID(ST_MakePoint(new.lon, new.lat), 4326);
+    return new;
+end;
+$$;
+
+drop trigger if exists community_reports_sync_location on public.community_reports;
+create trigger community_reports_sync_location
+    before insert or update of lat, lon on public.community_reports
+    for each row execute function public.sync_community_location();
+
+-- Seed: one report the sensors can confirm (swell near Paradip) and one they
+-- cannot (debris near Chennai) — good for exercising the verification matrix.
+insert into public.community_reports
+    (observed_at, category, description, reporter_role, lat, lon) values
+(now() - interval '6 hours', 'heavy_swell',
+ 'Heavy rolling swell breaking over the sandbar; small boats turning back.',
+ 'fisherman', 19.25, 86.85),
+(now() - interval '20 hours', 'debris',
+ 'Large drifting log and tangled net about 3 nm offshore.',
+ 'coastal_worker', 13.15, 80.35);
+
+-- 5) Chat / query log ------------------------------------------------
 create table if not exists public.user_queries (
     id            bigint generated always as identity primary key,
     created_at    timestamptz not null default now(),
@@ -80,7 +131,7 @@ create table if not exists public.user_queries (
     map_features  jsonb           -- GeoJSON FeatureCollection
 );
 
--- 5) PostGIS spatial function -----------------------------------------
+-- 6) PostGIS spatial function -----------------------------------------
 create or replace function public.check_hazard_zone(lat double precision, lon double precision)
 returns table (id bigint, name text, severity text, advisory text)
 language sql stable
@@ -90,7 +141,7 @@ as $$
     where ST_Contains(h.geometry, ST_SetSRID(ST_MakePoint(lon, lat), 4326));  -- lon FIRST
 $$;
 
--- 6) pgvector cosine-similarity RPC -------------------------------------
+-- 7) pgvector cosine-similarity RPC -------------------------------------
 create or replace function public.match_advisories(query_embedding vector(1536), match_count int default 3)
 returns table (id bigint, title text, category text, content text, similarity double precision)
 language sql stable
@@ -105,9 +156,12 @@ $$;
 -- Sanity check: this must return the cyclone row
 -- select * from public.check_hazard_zone(16.0, 86.5);
 
--- 7) Performance indexes (optimization pass) ----------------------------
+-- 8) Performance indexes (optimization pass) ----------------------------
 -- PFZ bulletin query filters on valid_until and sorts by chlorophyll.
 create index if not exists pfz_zones_valid_until_idx on public.pfz_zones (valid_until);
 create index if not exists pfz_zones_chlorophyll_idx on public.pfz_zones (chlorophyll desc);
 -- user_queries grows unbounded; keep recent-first lookups/cleanup fast.
 create index if not exists user_queries_created_at_idx on public.user_queries (created_at desc);
+
+-- Sanity check: this must return the two seeded community reports
+-- select * from public.community_reports;

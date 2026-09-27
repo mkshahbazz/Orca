@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     # userID is issued alongside it (required to resolve inference endpoints)
     bhashini_user_id: str = ""
     bhashini_api_key: str = ""
+    # Static/piped inference key. Bhashini normally returns this per pipeline
+    # call, but a pre-issued inference key can be supplied here so translation
+    # still works if the pipeline-config step is unreachable.
+    bhashini_inference_key: str = ""
 
 
 settings = Settings()

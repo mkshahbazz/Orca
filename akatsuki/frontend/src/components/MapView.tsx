@@ -2,8 +2,16 @@
 
 import "leaflet/dist/leaflet.css";          // must live in the client component
 import L from "leaflet";
-import { useEffect } from "react";
-import { CircleMarker, GeoJSON, MapContainer, TileLayer, Tooltip, useMap } from "react-leaflet";
+import { useEffect, useMemo } from "react";
+import {
+  CircleMarker,
+  GeoJSON,
+  MapContainer,
+  Popup,
+  TileLayer,
+  Tooltip,
+  useMap,
+} from "react-leaflet";
 
 /** Flies/fits the map whenever a new GeoJSON payload arrives. */
 function FlyController({ features, refreshKey }: { features: any; refreshKey: number }) {
@@ -65,6 +73,29 @@ function heatColor(t: number): string {
   return "rgb(216, 75, 61)";
 }
 
+const CATEGORY_LABELS: Record<string, string> = {
+  heavy_swell: "Heavy swell",
+  high_wave: "High waves",
+  rough_seas: "Rough seas",
+  high_wind: "High wind",
+  squall: "Squall",
+  thunderstorm: "Thunderstorm",
+  storm: "Storm",
+  strong_current: "Strong current",
+  debris: "Floating debris",
+  oil_spill: "Oil spill",
+  shoal: "Shoal",
+  fish_sighting: "Fish sighting",
+  other: "Report",
+};
+
+function whenLabel(value?: string) {
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  return d.toUTCString();
+}
+
 export default function MapView({
   mapFeatures,
   refreshKey = 0,
@@ -81,6 +112,26 @@ export default function MapView({
   gridMax?: number;
   gridLabel?: string;
 }) {
+  const features: any[] = mapFeatures?.features ?? [];
+
+  // Community reports arrive inside the same FeatureCollection but must be
+  // drawn as *distinct interactive pins*, not as filled polygons.
+  const communityPins = useMemo(
+    () => features.filter((f) => f?.properties?.pin === "community" || f?.properties?.zone === "community"),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [mapFeatures]
+  );
+  const zoneFeatures = useMemo(
+    () => ({
+      type: "FeatureCollection" as const,
+      features: features.filter(
+        (f) => f?.properties?.pin !== "community" && f?.properties?.zone !== "community"
+      ),
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [mapFeatures]
+  );
+
   return (
     <div className="absolute inset-0 z-0">
       <MapContainer center={[16.5, 84.5]} zoom={5} scrollWheelZoom className="h-full w-full">
@@ -91,14 +142,15 @@ export default function MapView({
         {gridCells && gridCells.length > 0 && (
           <HeatCells cells={gridCells} min={gridMin} max={gridMax} label={gridLabel} />
         )}
-        {mapFeatures?.features?.length > 0 && (
+        {zoneFeatures.features.length > 0 && (
           <GeoJSON
-            key={`${refreshKey}-${mapFeatures.features.length}`}   // force remount per payload
-            data={mapFeatures}
+            key={`${refreshKey}-${zoneFeatures.features.length}`}   // force remount per payload
+            data={zoneFeatures}
             style={zoneStyle}
             onEachFeature={onEachZone}
           />
         )}
+        <CommunityPins pins={communityPins} />
         <FlyController features={mapFeatures} refreshKey={refreshKey} />
       </MapContainer>
 
@@ -110,8 +162,65 @@ export default function MapView({
         <div className="flex items-center gap-2">
           <span className="inline-block h-3 w-3 rounded-sm bg-green-400" /> PFZ (potential fishing zone)
         </div>
+        <div className="mt-1 flex items-center gap-2">
+          <span className="inline-block h-3 w-3 rounded-full bg-cyan-400" /> Community report · verified
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="inline-block h-3 w-3 rounded-full bg-amber-400" /> Community report · unverified
+        </div>
       </div>
     </div>
+  );
+}
+
+/** Crowdsourced reports drawn as distinct, interactive map pins. */
+function CommunityPins({ pins }: { pins: any[] }) {
+  if (!pins.length) return null;
+  return (
+    <>
+      {pins.map((f, i) => {
+        const [lon, lat] = f?.geometry?.coordinates ?? [];
+        if (typeof lat !== "number" || typeof lon !== "number") return null;
+        const p = f.properties ?? {};
+        const verified = Boolean(p.verified);
+        const color = verified ? "#22d3ee" : "#f59e0b";
+        return (
+          <CircleMarker
+            key={`${lat}-${lon}-${i}`}
+            center={[lat, lon]}
+            radius={verified ? 9 : 7}
+            pathOptions={{
+              color: "#0f172a",
+              weight: 2,
+              fillColor: color,
+              fillOpacity: 0.95,
+            }}
+          >
+            <Tooltip direction="top" opacity={0.9}>
+              {CATEGORY_LABELS[p.category as string] ?? "Community report"}
+              {verified ? " · verified" : " · unverified"}
+            </Tooltip>
+            <Popup>
+              <strong>{CATEGORY_LABELS[p.category as string] ?? "Community report"}</strong>
+              {verified ? " ✅ verified" : " ⚠️ unverified"}
+              <br />
+              {p.description}
+              <br />
+              <em>
+                {p.reporter_role ? `${p.reporter_role} · ` : ""}
+                {whenLabel(p.observed_at)}
+              </em>
+              {p.verification_note ? (
+                <>
+                  <br />
+                  <small>{p.verification_note}</small>
+                </>
+              ) : null}
+            </Popup>
+          </CircleMarker>
+        );
+      })}
+    </>
   );
 }
 
