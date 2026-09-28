@@ -43,7 +43,7 @@ INTENTS = ("weather", "pfz_search", "hazard_check", "general_advisory")
 # intent -> workers to fan out to (every intent maps to >= 1 worker)
 TASK_MAP = {
     "weather":        ["weather", "community"],
-    "pfz_search":     ["pfz", "advisory", "community"],        "hazard_check":   ["geospatial", "weather", "advisory", "community"],
+    "pfz_search":     ["pfz", "advisory", "community", "weather_lenient"],        "hazard_check":   ["geospatial", "weather", "advisory", "community"],
     "general_advisory": ["advisory", "weather_lenient"],
 }
 
@@ -157,7 +157,24 @@ async def geospatial_node(state: AgentState) -> dict:
 
 
 async def pfz_node(state: AgentState) -> dict:
-    return {"pfz_data": await incois.get_pfz_bulletin()}
+    bulletin = await incois.get_pfz_bulletin()
+    if not (bulletin.get("geojson") or {}).get("features"):
+        # The spatial store has no active INCOIS rows right now — answer from
+        # the platform's operational zone model (the same source the dashboard
+        # map renders), enriched with live weather per zone.
+        try:
+            from app.dashboard import _pfz_features
+            feats = await _pfz_features()
+            if feats:
+                bulletin = {
+                    **bulletin,
+                    "zone_count": len(feats),
+                    "geojson": {"type": "FeatureCollection", "features": feats},
+                    "source": "Platform PFZ model (live-weather enriched)",
+                }
+        except Exception:
+            pass
+    return {"pfz_data": bulletin}
 
 
 async def advisory_node(state: AgentState) -> dict:
@@ -357,11 +374,19 @@ def _fallback_answer(state: AgentState, partial: str = "") -> str:
                      f"“{(r0.get('description') or '')[:160]}” — {tag}, {r0.get('observed_at') or 'recent'}"]
 
     if len(sections) <= 1:
-        # Nothing answered at all — say so plainly instead of shipping a shell.
+        # Nothing usable came back — say so plainly instead of shipping a shell.
         sections = [
             f"**Feed brief for {where}**",
             "",
-            "I could not reach any live feed just now — the ocean database, weather models and the advisory store all stayed silent, so I have nothing observed to report. Please try again in a few minutes; if this persists the platform's data connections need attention.",
+            (
+                "I could not reach the live feeds just now, so I have nothing "
+                "observed to report. Please try again in a few minutes."
+                if state.get("feed_errors")
+                else
+                "Every feed answered, but there is nothing active to report "
+                "right now — no zones in the bulletin, no matching advisories "
+                "and no community reports for this question."
+            ),
         ]
         return "\n".join(sections)
 
