@@ -43,9 +43,8 @@ INTENTS = ("weather", "pfz_search", "hazard_check", "general_advisory")
 # intent -> workers to fan out to (every intent maps to >= 1 worker)
 TASK_MAP = {
     "weather":        ["weather", "community"],
-    "pfz_search":     ["pfz", "advisory", "community"],
-    "hazard_check":   ["geospatial", "weather", "advisory", "community"],
-    "general_advisory": ["advisory"],
+    "pfz_search":     ["pfz", "advisory", "community"],        "hazard_check":   ["geospatial", "weather", "advisory", "community"],
+    "general_advisory": ["advisory", "weather_lenient"],
 }
 
 # Human-readable milestones the UI shows while it waits (live status transparency).
@@ -55,6 +54,7 @@ STATUS_LABELS = {
     "geospatial": "Checking hazard zones…",
     "pfz": "Fetching the PFZ bulletin…",
     "advisory": "Searching safety advisories…",
+    "weather_lenient": "Checking weather buoys…",
     "community": "Scanning community reports…",
     "verifying": "Cross-checking human reports against live sensors…",
     "synthesizing": "Writing safety report…",
@@ -121,6 +121,7 @@ def route_workers(state: AgentState) -> list[Send]:
     }
     node_map = {
         "weather": "weather_node",
+        "weather_lenient": "weather_node_lenient",
         "geospatial": "geospatial_node",
         "pfz": "pfz_node",
         "advisory": "advisory_node",
@@ -165,6 +166,15 @@ async def advisory_node(state: AgentState) -> dict:
     except Exception as exc:                      # embeddings not seeded yet
         matches = [{"note": f"advisory RAG unavailable: {exc}"}]
     return {"advisory_data": {"matches": matches}}
+
+
+async def weather_node_lenient(state: AgentState) -> dict:
+    """Weather for general questions: keep going when the feed is down so a
+    no-coordinate advisory question still gets its advisories answered."""
+    try:
+        return await weather_node(state)
+    except Exception as exc:
+        return {"feed_errors": [f"weather: {exc}"]}
 
 
 async def community_node(state: AgentState) -> dict:
@@ -346,6 +356,15 @@ def _fallback_answer(state: AgentState, partial: str = "") -> str:
         sections += ["", f"### Community reports ({len(reports)} near, {len(trusted)} verified)",
                      f"“{(r0.get('description') or '')[:160]}” — {tag}, {r0.get('observed_at') or 'recent'}"]
 
+    if len(sections) <= 1:
+        # Nothing answered at all — say so plainly instead of shipping a shell.
+        sections = [
+            f"**Feed brief for {where}**",
+            "",
+            "I could not reach any live feed just now — the ocean database, weather models and the advisory store all stayed silent, so I have nothing observed to report. Please try again in a few minutes; if this persists the platform's data connections need attention.",
+        ]
+        return "\n".join(sections)
+
     drawn = []
     if (g.get("geojson") or {}).get("features"):
         drawn.append("hazard zones in red")
@@ -409,8 +428,10 @@ async def synthesize_stream_node(state: AgentState):
 
 
 # ---------------------------------------------------------------- streaming
+
 _STREAM_NODE_MAP = {
     "weather": weather_node,
+    "weather_lenient": weather_node_lenient,
     "geospatial": geospatial_node,
     "pfz": pfz_node,
     "advisory": advisory_node,

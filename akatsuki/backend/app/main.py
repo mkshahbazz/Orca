@@ -121,6 +121,27 @@ def _target_language(requested: str | None) -> str:
     return requested
 
 
+def _translation_notice(requested: str | None) -> str | None:
+    """Honest note when a language was asked for but cannot be delivered.
+
+    Returned only when the user explicitly chose a non-English language and
+    Bhashini credentials are absent on the server — the answer stays in
+    English and says so, rather than silently ignoring the request.
+    """
+    if (
+        requested
+        and requested != "en"
+        and requested in bhashini.SUPPORTED_LANGUAGES
+        and not bhashini.is_configured()
+    ):
+        name = bhashini.SUPPORTED_LANGUAGES.get(requested, requested)
+        return (
+            f"_(You asked for {name}. Translation is not configured on this "
+            "deployment yet, so this answer is in English.)_"
+        )
+    return None
+
+
 def _friendly_error(exc: Exception) -> str:
     """Turn an internal exception into an honest, user-facing explanation."""
     if isinstance(exc, llm.LLMNotConfigured):
@@ -190,6 +211,10 @@ async def chat(req: ChatRequest):
     answer = final.get("response", "")
     if target != "en":
         answer = await bhashini.translate(answer, "en", target)
+    else:
+        notice = _translation_notice(req.language)
+        if notice:
+            answer = f"{answer}\n\n{notice}"
 
     _spawn_log_query({
         "query_text": req.message,
@@ -248,6 +273,10 @@ async def chat_stream(req: ChatRequest):
                         answer = await bhashini.translate(answer, "en", target)
                     # trimmed wire payload — internals (coordinates etc.)
                     # stay server-side; the UI only needs these keys
+                    if target == "en":
+                        notice = _translation_notice(req.language)
+                        if notice:
+                            answer = f"{answer}\n\n{notice}"
                     yield sse("final", {
                         "response": answer,
                         "map_features": payload.get("map_features") or EMPTY_FC,
