@@ -83,6 +83,72 @@ _AREA_SPAN_DEG = 1.5
 # requirement is to answer for the queried point and say what it covers.
 _TOO_BROAD_DEG = 12.0
 
+# ---------------------------------------------------------------- coastline atlas
+# The marine data feeds, the operating area and the default map all centre on
+# the Indian coast, and some hosting networks cannot reach the primary geocoder
+# at all. A small coastline atlas covers the names people actually ask for that
+# the fallback geocoder misses (states, seas, and spelling variants it stores
+# with diacritics like "Gopālpur"), so those still resolve to the right waters.
+# Anything else still goes to the geocoders — this is a floor, not a ceiling.
+_COASTLINE_ATLAS: dict[str, tuple[str, float, float, str]] = {
+    # name -> (label, lat, lon, scope)
+    "kerala": ("Kerala", 10.223, 75.956, "region"),
+    "odisha": ("Odisha", 19.171, 84.873, "region"),
+    "orissa": ("Odisha", 19.171, 84.873, "region"),
+    "west bengal": ("West Bengal", 21.9, 87.9, "region"),
+    "bengal": ("West Bengal", 21.9, 87.9, "region"),
+    "bay of bengal": ("Bay of Bengal", 12.994, 85.758, "sea"),
+    "arabian sea": ("Arabian Sea", 14.5, 68.5, "sea"),
+    "indian ocean": ("Indian Ocean", 8.0, 78.0, "sea"),
+    "andaman sea": ("Andaman Sea", 11.5, 96.5, "sea"),
+    "lakshadweep sea": ("Lakshadweep Sea", 10.6, 72.6, "sea"),
+    "gulf of mannar": ("Gulf of Mannar", 8.9, 78.5, "sea"),
+    "palk bay": ("Palk Bay", 9.6, 79.6, "sea"),
+    "palk strait": ("Palk Strait", 10.3, 79.9, "sea"),
+    "gulf of khambhat": ("Gulf of Khambhat", 21.3, 72.4, "sea"),
+    "gulf of kutch": ("Gulf of Kutch", 22.7, 69.3, "sea"),
+    "andaman and nicobar": ("Andaman and Nicobar Islands", 11.7, 92.7, "region"),
+    "andaman & nicobar": ("Andaman and Nicobar Islands", 11.7, 92.7, "region"),
+    "gopalpur": ("Gopalpur", 19.259, 84.905, "point"),
+    "mangalore": ("Mangalore", 12.869, 74.842, "point"),
+    "kollam": ("Kollam", 8.893, 76.614, "point"),
+    "thiruvananthapuram": ("Thiruvananthapuram", 8.485, 76.949, "point"),
+    "trivandrum": ("Thiruvananthapuram", 8.485, 76.949, "point"),
+    "kanyakumari": ("Kanyakumari", 8.079, 77.55, "point"),
+    "rameswaram": ("Rameswaram", 9.288, 79.312, "point"),
+    "digha": ("Digha", 21.627, 87.509, "point"),
+    "shankarpur": ("Shankarpur", 21.675, 87.571, "point"),
+    "mandarmani": ("Mandarmani", 21.66, 87.79, "point"),
+    "sunderbans": ("Sunderbans", 21.95, 89.2, "region"),
+    "sundarbans": ("Sunderbans", 21.95, 89.2, "region"),
+    "sagar island": ("Sagar Island", 21.745, 88.118, "point"),
+    "gangasagar": ("Sagar Island", 21.745, 88.118, "point"),
+    "chandipur": ("Chandipur", 21.467, 87.017, "point"),
+    "talasari": ("Talasari", 21.6, 87.15, "point"),
+}
+
+
+def _atlas_entry(name: str) -> dict | None:
+    """Atlas hit for an exact name (folded), honouring the cache contract."""
+    key = name.strip().lower()
+    hit = _COASTLINE_ATLAS.get(key)
+    if not hit:
+        return None
+    label, lat, lon, scope = hit
+    return {
+        "query": name,
+        "label": label,
+        "display_name": f"{label}, India" if scope == "region" else label,
+        "lat": lat,
+        "lon": lon,
+        "scope": scope,
+        "bbox": None,
+        "source": "SEAMONK coastline atlas",
+        "feature": "place/coastal" if scope == "point" else "area/coastal",
+        "representative": scope != "point",
+        "too_broad": False,
+    }
+
 
 # ---------------------------------------------------------------- helpers
 def _cache_get(key: str) -> tuple[bool, dict | None]:
@@ -339,8 +405,23 @@ async def resolve(place: str) -> dict | None:
     if cached:
         return value
 
+    # The coastline atlas answers for the coastal names the geocoders can miss —
+    # states, seas, and spellings stored with diacritics ("Gopālpur"). It is
+    # consulted first because it is exact-name only: anything it does not know
+    # falls through to the live geocoders as before.
+    atlas = _atlas_entry(query)
+    if atlas:
+        _cache_put(query, atlas)
+        return atlas
+
     rows = await _nominatim(query) or await _open_meteo_geocode(query)
     if not rows:
+        # One more atlas chance: "off Odisha", "near Gopalpur" — the strip in
+        # clean_query leaves the name, but the geocoders may still have failed.
+        atlas = _atlas_entry(query)
+        if atlas:
+            _cache_put(query, atlas)
+            return atlas
         log.info("location %r could not be resolved", place)
         _cache_put(query, None)
         return None
@@ -350,6 +431,16 @@ async def resolve(place: str) -> dict | None:
     named = [r for r in rows if _same_name(r, query)] or rows
     indian = [r for r in named if r["country_code"] == "in"]
     pool = indian or named
+
+    # The fallback geocoder stores many Indian names with diacritics and its
+    # accent-folded match may be a foreign namesake ("Kerala" -> "Kerälä",
+    # Finland). Never let that stand in for a coastal name the atlas knows.
+    first = (pool[0].get("display_name") or "").split(",")[0].strip().lower()
+    if first != query.strip().lower():
+        atlas = _atlas_entry(query)
+        if atlas:
+            _cache_put(query, atlas)
+            return atlas
 
     entry = pool[0]
     scope = _scope_for(entry)

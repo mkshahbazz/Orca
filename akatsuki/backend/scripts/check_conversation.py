@@ -466,6 +466,36 @@ async def test_provider_outage() -> None:
         agents.chat_markdown_stream = stub_chat_markdown_stream
 
 
+async def test_location_floor() -> None:
+    """Names a hosting network without Nominatim must still resolve."""
+    print("\n== Coastline atlas floor (Requirement 3) ==")
+    for query, label, scope in [
+        ("Kerala", "Kerala", "region"),
+        ("Odisha", "Odisha", "region"),
+        ("Bay of Bengal", "Bay of Bengal", "sea"),
+        ("Arabian Sea", "Arabian Sea", "sea"),
+        ("Gopalpur", "Gopalpur", "point"),
+        ("Mangalore", "Mangalore", "point"),
+        ("Sagar Island", "Sagar Island", "point"),
+    ]:
+        loc = await location.resolve(query)
+        got = (loc or {}).get("label")
+        check(f"atlas: {query!r} resolves to {label}", got == label, str(loc)[:90])
+        check(f"atlas: {query!r} scope is {scope}", (loc or {}).get("scope") == scope,
+              str((loc or {}).get("scope")))
+        check(f"atlas: {query!r} sits in India's waters",
+              5 <= (loc or {}).get("lat", 0) <= 30 and 65 <= (loc or {}).get("lon", 0) <= 95,
+              str((loc or {}).get('lat')) + "," + str((loc or {}).get('lon')))
+    # the atlas is a floor, not a ceiling: the geocoder stays authoritative
+    final = await run("What is the weather in Chennai?")
+    check("geocoder still answers for cities the atlas does not list",
+          (final.get("location") or {}).get("label") == "Chennai",
+          json.dumps(final.get("location"))[:90])
+    final = await run("What is the weather in Qzzxbland?")
+    check("atlas does not invent answers for unknown names",
+          final.get("needs_location") is True, final.get("response", "")[:90])
+
+
 async def main() -> int:
     print("Live feeds: Open-Meteo marine/forecast + OpenStreetMap geocoding")
     await weather.startup()
@@ -474,6 +504,7 @@ async def main() -> int:
     await test_followups()
     await test_writer_input()
     await test_fallback_style()
+    await test_location_floor()
     await test_provider_outage()
     await weather.shutdown()
 
