@@ -133,19 +133,111 @@ ROUTER_SYS = (
 
 # Deterministic keyword sets used ONLY when the router LLM is unreachable, so the
 # assistant still classifies sanely instead of treating everything as marine.
+# Matching is whole-word (with a small plural/gerund tail), so "sea" cannot
+# fire inside "please" and "wind" cannot fire inside "window".
 _MARINE_WORDS = (
-    "weather", "wave", "waves", "wind", "windy", "gust", "gusts", "swell", "sea", "seas",
+    "weather", "wave", "swell", "wind", "gust", "sea", "marine", "maritime", "condition",
     "cyclone", "storm", "rain", "temperature", "forecast", "tide", "visibility", "monsoon",
-    "cloud", "cloudy", "rough", "calm",
+    "cloud", "rough", "calm", "offshore", "coastal", "advisory", "fog", "surf",
 )
 _PFZ_WORDS = ("pfz", "fishing zone", "fish zone", "fish zones", "chlorophyll", "fish biting", "best fishing", "where are the fish")
-_SAFETY_WORDS = ("safe", "safety", "hazard", "danger", "dangerous", "risky", "venture", "sail", "boat", "boats", "trawler", "fish", "fishing")
+# A judgement about going out, rather than a reading of the conditions
+_SAFETY_WORDS = ("safe", "safety", "hazard", "danger", "dangerous", "risky", "risk",
+                 "venture", "capsize", "warning", "warn", "suitable", "allowed")
+# …and the craft/activity a safe-or-not question is about
+_CRAFT_WORDS = ("boat", "sail", "trawler", "vessel", "ship", "craft", "fish", "fishing",
+                "ferry", "kayak", "yacht", "swim", "swimming", "dive", "diving")
+# Cues that a message is about the same place as the previous turn. Deliberately
+# narrow: "explain that" alone is ordinary conversation ("explain AI"), while a
+# time word or "what about" clearly continues the marine thread.
+_FOLLOWUP_WORDS = ("tomorrow", "today", "tonight", "this evening", "next week", "weekend",
+                   "later tonight", "what about", "how about", "those", "that forecast",
+                   "same area", "same place", "in detail", "more detail")
 
 
 def _extract_coords(text: str) -> dict[str, float] | None:
     m = _COORD_RE.search(text)
     if m:
         return {"lat": float(m.group("lat")), "lon": float(m.group("lon"))}
+    return None
+
+
+# Words that are never part of a place name here: the question's own scaffolding
+# (what/where/is/in/near…), marine vocabulary, and time words. What is left over
+# is the user's own place name, and only that is offered to the geocoder.
+_STOPWORDS = frozenset("""
+about after again all also am an and any are around as ask at back be because been before being
+below between both but by can could did do does doing down during each few for from further get
+give goes going had has have having here how if in into is it its just kind like me more most much
+my near need nice no nor not of off on once only or other our out over own please say see should
+show so some such tell than that the their them then there these they this those through to too
+under until up us was way we were what when where which while who whom why will with would yes you
+your
+good morning evening afternoon night hello hey hi namaste thanks thank ok okay great cool right
+weather marine maritime sea condition state wave swell wind gust forecast tide temperature rain
+storm cyclone monsoon cloud visibility rough calm fog advisory condition conditions safety safe
+hazard danger dangerous risky risk suitable allowed boat boats sail sailing fishing fish trawler
+vessel ship craft ferry swim swimming dive diving coastal offshore report reports check info
+information level current currently latest today tomorrow tonight yesterday soon later""".split())
+
+# Describing words that appear in marine questions ("is the wind strong?", "is it
+# suitable for small boats?") and would otherwise be read as a place name.
+_STOPWORDS |= frozenset("""
+strong weak high low big small large heavy light moderate fresh calm rough fast slow deep shallow
+far close explain describe mean means average overall generally mostly really very quite still
+even much many few bad better worse best worst warm hot cold wet dry early late quick quickly hard
+soft easy hard difficult available possible happen happens change changes expect expected
+""".split())
+
+_NON_PLACE_WORD = re.compile(r"^[a-z0-9'\-]{1,2}$")
+
+# The waters this platform serves (Indian coast, Bay of Bengal, Arabian Sea and
+# the neighbouring seas). The offline guesser only accepts a name it recognises
+# inside this box, so an ordinary word that happens to be some village abroad
+# ("Strong", Arkansas) can never be mistaken for the place being asked about.
+_OPERATING_AREA = ((-6.0, 32.0), (45.0, 100.0))
+
+
+def _serves_these_waters(loc: dict) -> bool:
+    lat, lon = loc.get("lat"), loc.get("lon")
+    if lat is None or lon is None:
+        return False
+    return (_OPERATING_AREA[0][0] <= lat <= _OPERATING_AREA[0][1]
+            and _OPERATING_AREA[1][0] <= lon <= _OPERATING_AREA[1][1])
+
+
+def _is_that_place(loc: dict, phrase: str) -> bool:
+    """The geocoder must have matched the very words the user wrote."""
+    first = (loc.get("display_name") or "").split(",")[0].strip().lower()
+    return bool(first) and first == phrase.strip().lower()
+
+
+async def _guess_place(message: str) -> str | None:
+    """Read a place out of the user's own words when the router model is down.
+
+    Every phrase the user actually wrote is tried, longest first, and accepted
+    only when the geocoder recognises that exact name — so no place is invented
+    and no other place is ever substituted for the one that was asked about.
+    """
+    words = re.findall(r"[A-Za-z][A-Za-z'\-]*", message)
+    kept = [i for i, w in enumerate(words) if w.lower() not in _STOPWORDS
+            and not _NON_PLACE_WORD.match(w)]
+    if not kept:
+        return None
+    candidates: list[str] = []
+    for start in kept:
+        for end in reversed(kept):
+            if end < start:
+                continue
+            candidates.append(" ".join(words[start:end + 1]))
+    ordered = sorted(dict.fromkeys(candidates), key=lambda c: (-len(c.split()), len(c)))
+    for phrase in ordered[:4]:
+        try:
+            loc = await location.resolve(phrase)
+        except Exception:
+            return None
+        if loc and _is_that_place(loc, phrase) and _serves_these_waters(loc):
+            return phrase
     return None
 
 
@@ -176,21 +268,41 @@ def _router_input(state: AgentState) -> str:
     return "\n".join(parts)
 
 
-def _heuristic_intent(message: str, coords: dict | None) -> tuple[str, str | None, bool]:
-    """Offline classifier used only when the router LLM fails. -> (intent, location, followup)"""
+def _mentions(text: str, words: tuple[str, ...]) -> bool:
+    """Whole-word match with a small plural/gerund tail."""
+    for word in words:
+        if re.search(rf"(?<![a-z]){re.escape(word)}(?:s|es|ing|ed|y)?(?![a-z])", text):
+            return True
+    return False
+
+
+def _heuristic_intent(
+    message: str, coords: dict | None, has_prior: bool = False
+) -> tuple[str, bool]:
+    """Offline classifier used only when the router LLM fails -> (intent, followup).
+
+    It decides only what is being asked. Place names are read from the user's own
+    words by `_guess_place`, never mined here and never guessed.
+    """
     msg = message.lower()
-    if any(w in msg for w in _PFZ_WORDS):
-        return "pfz_search", None, False
+    if _mentions(msg, _PFZ_WORDS):
+        return "pfz_search", True
     if coords is not None:
-        return "hazard_check", None, False
-    if any(w in msg for w in _MARINE_WORDS):
-        if any(w in msg for w in _SAFETY_WORDS):
-            return "hazard_check", None, True
-        return "weather", None, True
-    if any(w in msg for w in _SAFETY_WORDS):
-        return "pfz_search", None, True
+        return "hazard_check", False
+    marine = _mentions(msg, _MARINE_WORDS)
+    safety = _mentions(msg, _SAFETY_WORDS)
+    craft = _mentions(msg, _CRAFT_WORDS)
+    if safety and (marine or craft):
+        return "hazard_check", True
+    if marine:
+        return "weather", True
+    if craft:
+        return "pfz_search", True
+    if has_prior and _mentions(msg, _FOLLOWUP_WORDS):
+        # "What about tomorrow?" continues the marine thread of the last answer.
+        return "weather", True
     # Nothing marine was asked for: this is ordinary conversation, not a report.
-    return "conversation", None, False
+    return "conversation", False
 
 
 async def router_node(state: AgentState) -> dict:
@@ -213,9 +325,14 @@ async def router_node(state: AgentState) -> dict:
                 pass
         followup = bool(out.get("followup"))
     except Exception:
-        intent, location_query, followup = _heuristic_intent(state["message"], coords)
-        # No place name is mined from the text without the model: a location must
-        # come from the user's own words or from the conversation, never a guess.
+        intent, followup = _heuristic_intent(
+            state["message"], coords, bool(state.get("prior_location"))
+        )
+        # The model is down, so the place is read from the user's own words and
+        # accepted only if the geocoder knows that exact name. A message that
+        # names no place falls back to the conversation, never to a guess.
+        if intent != "conversation":
+            location_query = await _guess_place(state["message"])
     return {
         "intent": intent,
         "coordinates": coords,
@@ -742,6 +859,35 @@ def _day_phrase(day: dict | None) -> str | None:
     return ", ".join(bits)
 
 
+def _conversation_reply(message: str) -> str:
+    """A plain, honest reply for ordinary talk when the writer model is down.
+
+    Nothing about the sea is asserted here — the point of Requirement 1 is that
+    a greeting is answered as a greeting, not as a partly-filled marine brief.
+    """
+    msg = message.lower()
+    if re.search(r"\b(hi|hello|hey|good (morning|evening|afternoon)|namaste)\b", msg):
+        return "Hello! How can I help you with the sea today?"
+    if re.search(r"\b(thank|thanks|cheers|appreciate)\b", msg):
+        return "You're welcome. Ask me any time you want the conditions for a place."
+    if re.search(r"\b(bye|goodbye|see you|good night|goodnight)\b", msg):
+        return "Fair winds — the Monk is here whenever you need the sea read."
+    if re.search(r"\bhow are you\b|\bhow's it going\b", msg):
+        return "I'm well, thank you. What would you like to know about the sea?"
+    if re.search(r"\b(who are you|your name|what are you|about you)\b", msg):
+        return ("I'm the Seamonk, the assistant of this platform — I read live marine weather, "
+                "fishing-zone and safety data and explain what it means for a place.")
+    if re.search(r"\b(what can you do|what do you do|help|capabilit|features)\b", msg):
+        return ("I can explain live marine weather and sea state for any place or coordinates, "
+                "look up PFZ fishing zones, check recorded hazard zones for a position, "
+                "summarise voyage-safety advisories, and fold in reports from fishers. "
+                "Ask me about a place — for example “what is the weather in Chennai?”.")
+    if re.search(r"\b(ok|okay|great|nice|cool|got it|alright|sure|good)\b", msg):
+        return "Glad to help. Ask me whenever you want the conditions for a place."
+    return ("I'm listening. Ask me about conditions, fishing zones or safety for any place on "
+            "the coast and I'll explain what the data shows.")
+
+
 def _fallback_answer(state: AgentState, partial: str = "") -> str:
     """Compose the answer from the live feeds when the AI writer is unreachable.
 
@@ -749,6 +895,11 @@ def _fallback_answer(state: AgentState, partial: str = "") -> str:
     wording is conversational — it explains what the readings mean instead of
     listing them — and every number still comes from an observed/model feed.
     """
+    if state.get("conversation") or state.get("intent") == "conversation":
+        # Ordinary conversation: no feeds were read, so nothing about the sea is
+        # reported — the user gets a reply, not an empty marine brief.
+        return partial or _conversation_reply(state["message"])
+
     if state.get("needs_location"):
         return _clarification(state)
 

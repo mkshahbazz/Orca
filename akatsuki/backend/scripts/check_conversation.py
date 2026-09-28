@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("OPENAI_API_KEY", "stub-key-for-offline-run")
 
-from app import agents                                    # noqa: E402
+from app import agents, llm                               # noqa: E402
 from app.services import location, weather                # noqa: E402
 
 PASS = []
@@ -380,6 +380,92 @@ async def test_fallback_style() -> None:
     check("region answer does not claim the whole area", "not for the whole area" in out)
 
 
+# ---------------------------------------------------------------- 6. outage
+async def test_provider_outage() -> None:
+    """Router *and* writer unreachable — the path a key-less deployment takes.
+
+    Both entry points raise, so the deterministic classifier and the live-feed
+    writer below it answer instead. The three requirements must still hold: a
+    greeting is a greeting, a named place is still that place, and a marine
+    question is never read as small talk.
+    """
+    print("\n== Router + writer unavailable (offline path) ==")
+
+    async def down_json(system: str, user: str) -> dict:
+        raise llm.LLMUnavailable("provider unreachable")
+
+    async def down_markdown(system: str, user: str) -> str:
+        raise llm.LLMUnavailable("provider unreachable")
+
+    async def down_markdown_stream(system: str, user: str):
+        raise llm.LLMUnavailable("provider unreachable")
+        yield ""                                          # pragma: no cover
+
+    agents.chat_json = down_json
+    agents.chat_markdown = down_markdown
+    agents.chat_markdown_stream = down_markdown_stream
+    try:
+        final = await run("Hello")
+        check("offline: 'Hello' is still conversation",
+              final.get("intent") == "conversation", final.get("intent"))
+        check("offline: 'Hello' is not answered with a marine brief",
+              "Sea state" not in final.get("response", "")
+              and "live weather and sea-state feeds" not in final.get("response", ""),
+              final.get("response", "")[:90])
+        check("offline: 'Hello' gets a conversational reply",
+              "help" in final.get("response", "").lower(), final.get("response", "")[:90])
+
+        final = await run("What is the weather in Chennai?")
+        check("offline: a named place is still resolved",
+              (final.get("location") or {}).get("label") == "Chennai",
+              json.dumps(final.get("location"))[:90])
+        check("offline: the named place is not replaced by a word from the question",
+              (final.get("location") or {}).get("lat") == 13.084,
+              json.dumps(final.get("location"))[:90])
+        check("offline: the answer explains the conditions",
+              "Waves" in final.get("response", "") and "Sea state" in final.get("response", ""),
+              final.get("response", "")[:90])
+
+        final = await run("What are the weather conditions in Odisha?")
+        check("offline: Odisha is not West Bengal",
+              (final.get("location") or {}).get("label") == "Odisha",
+              json.dumps(final.get("location"))[:90])
+        check("offline: a region says where its sample point is",
+              "representative point" in final.get("response", ""),
+              final.get("response", "")[:90])
+
+        final = await run("What are the marine conditions in Kerala?")
+        check("offline: a marine question is not read as conversation",
+              final.get("intent") != "conversation", final.get("intent"))
+        check("offline: Kerala resolves to Kerala",
+              (final.get("location") or {}).get("label") == "Kerala",
+              json.dumps(final.get("location"))[:90])
+
+        chennai = await run("What is the weather in Chennai?")
+        follow = await run("Is the wind strong?", context={
+            "location": "Chennai", "lat": 13.084, "lon": 80.27,
+            "scope": "point", "representative": False,
+        })
+        check("offline: 'Is the wind strong?' keeps the earlier place",
+              (follow.get("location") or {}).get("label") == "Chennai",
+              json.dumps(follow.get("location"))[:90])
+        check("offline:  ... and answers with the wind, not a place called 'Strong'",
+              "Winds" in follow.get("response", ""), follow.get("response", "")[:90])
+        check("offline: the first Chennai answer used the same point",
+              (chennai.get("location") or {}).get("lat") == 13.084,
+              json.dumps(chennai.get("location"))[:90])
+
+        final = await run("Thanks!", context={
+            "location": "Chennai", "lat": 13.084, "lon": 80.27, "scope": "point",
+        })
+        check("offline: 'Thanks!' is conversation, not a new report",
+              final.get("intent") == "conversation", final.get("intent"))
+    finally:
+        agents.chat_json = stub_chat_json
+        agents.chat_markdown = stub_chat_markdown
+        agents.chat_markdown_stream = stub_chat_markdown_stream
+
+
 async def main() -> int:
     print("Live feeds: Open-Meteo marine/forecast + OpenStreetMap geocoding")
     await weather.startup()
@@ -388,6 +474,7 @@ async def main() -> int:
     await test_followups()
     await test_writer_input()
     await test_fallback_style()
+    await test_provider_outage()
     await weather.shutdown()
 
     print(f"\n{'=' * 64}\n{len(PASS)} passed, {len(FAIL)} failed")
