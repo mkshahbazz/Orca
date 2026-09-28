@@ -70,11 +70,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   position: absolute;
   inset: 0;
   z-index: -5;
-  background: url('/assets/orca-hero-base.jpg') center 58% / cover no-repeat;
+  background: url('/assets/orca-hero-4k.jpg') center 58% / cover no-repeat;
   transform: scale(1);
   will-change: transform;
   backface-visibility: hidden;
-  filter: saturate(.95) contrast(1.05) brightness(.9);
+  filter: saturate(1.06) contrast(1.1) brightness(.94);
 }
 
 .gw-ocean-glow {
@@ -86,6 +86,78 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
     radial-gradient(58% 30% at 50% 100%, rgba(43, 130, 220, .18), transparent 70%),
     radial-gradient(40% 22% at 50% 62%, rgba(120, 190, 255, .10), transparent 70%);
   mix-blend-mode: screen;
+}
+
+/* ---------- living ocean FX (children of .gw-bg) ---------- */
+.gw-starfx,
+.gw-waves,
+.gw-oceanfx,
+.gw-moonbloom {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* Additive starlight over the photo's sky (screen blend = light only).
+   Water line ≈ 54.5% of frame — canvas stars stop above it. */
+.gw-starfx {
+  z-index: 2;
+  mix-blend-mode: screen;
+  opacity: .9;
+}
+.gw-starfx canvas { width: 100%; height: 100%; display: block; }
+
+/* Pre-displaced wave texture, two depths GPU-drifted forever. */
+.gw-waves { overflow: hidden; z-index: 1; }
+.gw-wave {
+  position: absolute;
+  inset: -2% -4%;
+  transform: translate3d(0, 0, 0);
+  will-change: transform;
+  mix-blend-mode: screen;
+}
+.gw-wave svg { width: 100%; height: 100%; }
+.gw-wave-a { top: 54.5%; bottom: 0; height: auto; inset: 54.5% -4% -2% -4%; opacity: .5; animation: gwDrift 26s linear infinite; }
+.gw-wave-b { inset: 56% -4% -2% -4%; opacity: .34; animation: gwDrift 41s linear infinite reverse; }
+@keyframes gwDrift {
+  from { transform: translate3d(0, 0, 0); }
+  to { transform: translate3d(-48px, 2px, 0); }
+}
+
+/* Moonlight shimmer / glints / mist canvas. */
+.gw-oceanfx { transform: translate3d(var(--fxLean, 0px), 0, 0); transition: transform 1.1s cubic-bezier(.22, .8, .3, 1); }
+
+/* Moon bloom + cool nocturnal grade. */
+.gw-moonbloom {
+  z-index: 4;
+  background:
+    radial-gradient(6% 4.5% at 65% 19.5%, rgba(215, 238, 255, .32), rgba(215, 238, 255, .08) 55%, transparent 75%),
+    radial-gradient(22% 17% at 65% 19.5%, rgba(140, 190, 250, .17), transparent 70%);
+  mix-blend-mode: screen;
+}
+
+/* Occasional meteors in the starfield. */
+.gw-meteor {
+  position: absolute;
+  top: 12%;
+  left: 78%;
+  width: 150px;
+  height: 1.5px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, transparent, rgba(220, 240, 255, .9));
+  opacity: 0;
+  transform: rotate(-24deg);
+  filter: drop-shadow(0 0 4px rgba(200, 230, 255, .8));
+  pointer-events: none;
+}
+.gw-meteor.m1 { animation: gwMeteor 11s ease-in 2.5s infinite; }
+.gw-meteor.m2 { top: 6%; left: 58%; width: 110px; animation: gwMeteor 17s ease-in 9s infinite; }
+.gw-meteor.m3 { top: 20%; left: 88%; width: 90px; animation: gwMeteor 23s ease-in 15s infinite; }
+@keyframes gwMeteor {
+  0% { opacity: 0; transform: rotate(-24deg) translate3d(0, 0, 0); }
+  4% { opacity: .95; }
+  12% { opacity: 0; transform: rotate(-24deg) translate3d(-260px, 116px, 0); }
+  100% { opacity: 0; transform: rotate(-24deg) translate3d(-260px, 116px, 0); }
 }
 
 .gw-shade {
@@ -799,5 +871,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .gw-halo, .gw-scrollhint, .dx-live-dot::after { animation: none; }
+  .gw-halo, .gw-scrollhint, .dx-live-dot::after,
+  .gw-wave-a, .gw-wave-b, .gw-meteor { animation: none; }
+  .gw-oceanfx { transition: none; }
 }
+
+/* FP16 rounding + forced-compositor hygiene for the FX stack. */
+.gw-bg > *:not(.gw-oceanfx) { transform: translateZ(0); }

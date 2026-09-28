@@ -9,6 +9,7 @@ import {
   Send,
   Waves,
 } from "lucide-react";
+import { OceanFX, WaveField } from "./oceanfx";
 import "./seamonk.css";
 
 /**
@@ -52,7 +53,7 @@ function Starfield() {
       const count = Math.min(340, Math.floor((w * h) / 5200));
       stars = Array.from({ length: count }, () => ({
         x: Math.random() * w,
-        y: Math.random() * h * 0.72,
+        y: Math.random() * h * 0.5,
         r: Math.random() * 1.25 + 0.3,
         tw: Math.random() * 1.6 + 0.4,
         ph: Math.random() * Math.PI * 2,
@@ -69,7 +70,9 @@ function Starfield() {
     };
 
     let t = 0;
+    let visible = !document.hidden;
     const draw = () => {
+      if (!visible) return; // pause starlight while the tab is hidden
       t += 0.016;
       ctx.clearRect(0, 0, w, h);
       for (const s of stars) {
@@ -92,10 +95,16 @@ function Starfield() {
 
     resize();
     raf = requestAnimationFrame(draw);
+    const onVis = () => {
+      visible = !document.hidden;
+      if (visible) raf = requestAnimationFrame(draw);
+    };
     window.addEventListener("resize", resize);
+    document.addEventListener("visibilitychange", onVis);
     return () => {
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", resize);
+      document.removeEventListener("visibilitychange", onVis);
     };
   }, []);
 
@@ -137,6 +146,8 @@ export default function SeamonkLanding() {
       const my =
         (pointer.y - 0.5) * 14 * parallax - eased * window.innerHeight * 0.03;
       bg.style.transform = `translate3d(${mx.toFixed(2)}px, ${my.toFixed(2)}px, 0) scale(${scale.toFixed(4)})`;
+      // Water leans subtly toward the cursor (consumed by .gw-oceanfx).
+      bg.style.setProperty("--fxLean", `${((pointer.x - 0.5) * 14 * parallax).toFixed(2)}px`);
 
       const ringP = Math.max(0, Math.min(1, (p - 0.3) / 0.45));
       rings.style.opacity = ringP.toFixed(3);
@@ -209,10 +220,22 @@ export default function SeamonkLanding() {
     <div className="landing">
       <div className="gw-track">
         <div className="gw-stage" ref={stageRef}>
-          <div className="gw-stars" aria-hidden="true">
-            <Starfield />
+          {/* The living ocean: FX layers are children of the transformed
+              stage so they zoom/parallax in perfect registration with the
+              hero photo (all trapped inside gw-bg's z-band, under the UI).
+              The starfield uses screen blending to add light over the
+              photo's night sky — impossible from behind an opaque JPEG. */}
+          <div className="gw-bg" ref={bgRef} aria-hidden="true">
+            <div className="gw-starfx">
+              <Starfield />
+            </div>
+            <WaveField />
+            <OceanFX />
+            <div className="gw-moonbloom" />
+            <span className="gw-meteor m1" />
+            <span className="gw-meteor m2" />
+            <span className="gw-meteor m3" />
           </div>
-          <div className="gw-bg" ref={bgRef} aria-hidden="true" />
           <div className="gw-ocean-glow" aria-hidden="true" />
           <div className="gw-shade" aria-hidden="true" />
 
