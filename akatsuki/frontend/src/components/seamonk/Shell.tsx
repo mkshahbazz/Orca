@@ -39,6 +39,7 @@ import {
   Warning,
 } from "./icons";
 import { relLabel, SourceTag, Status } from "./primitives";
+import { MonkChat, MonkLauncher } from "./MonkChat";
 
 export type NavItem = {
   href: string;
@@ -85,6 +86,7 @@ export function Shell({ children }: { children: ReactNode }) {
   const [railOpen, setRailOpen] = useState(false);
   const [bellOpen, setBellOpen] = useState(false);
   const [userOpen, setUserOpen] = useState(false);
+  const [monkOpen, setMonkOpen] = useState(false);
 
   const bellRef = useOutside(bellOpen, () => setBellOpen(false));
   const userRef = useOutside(userOpen, () => setUserOpen(false));
@@ -271,6 +273,8 @@ export function Shell({ children }: { children: ReactNode }) {
           </div>
 
           <div className="sk-head-right">
+            <MonkLauncher open={monkOpen} onToggle={() => setMonkOpen((v) => !v)} />
+
             <button
               type="button"
               className="sk-iconbtn sk-hide-sm"
@@ -420,6 +424,11 @@ export function Shell({ children }: { children: ReactNode }) {
         <main className="sk-main" id="sk-main">
           {children}
         </main>
+
+        {/* Ask the Monk — persistent console window, one instance for every page */}
+        <div id="sk-monk-panel">
+          <MonkChat open={monkOpen} onClose={() => setMonkOpen(false)} />
+        </div>
 
         <footer className="sk-foot">
           {sea.systems.length ? (

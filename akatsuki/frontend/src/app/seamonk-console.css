@@ -3016,3 +3016,355 @@ body {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ============================================================================
+   ASK THE MONK — the console's conversational instrument
+   ----------------------------------------------------------------------------
+   Same rules as every other console surface: navy panels, hairline borders,
+   mono for data, colour only where it carries meaning. It reads as part of
+   the console because it is part of the console.
+   ========================================================================= */
+
+.sk-monk-launch {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 12px 0 10px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--r-sm);
+  background: linear-gradient(180deg, rgba(46, 196, 196, 0.10), rgba(46, 196, 196, 0.04));
+  color: var(--teal);
+  font: 600 12px/1 var(--font-ui);
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+.sk-monk-launch:hover,
+.sk-monk-launch.is-open {
+  border-color: rgba(46, 196, 196, 0.5);
+  color: #7fe0e0;
+}
+.sk-monk-launch.is-open {
+  background: var(--teal-soft);
+}
+
+#sk-monk-panel {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 1200;
+  pointer-events: none;
+}
+#sk-monk-panel > * {
+  pointer-events: auto;
+}
+
+.sk-monk {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  width: min(400px, calc(100vw - 36px));
+  height: min(560px, calc(100vh - 120px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: linear-gradient(180deg, var(--ink-2), var(--ink-1));
+  border: 1px solid var(--line-hair);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-panel), 0 24px 60px rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  transform: translateY(10px) scale(0.985);
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.sk-monk.is-open {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+}
+
+.sk-monk-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--line-hair);
+  background: rgba(7, 26, 46, 0.72);
+}
+.sk-monk-mark {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid rgba(46, 196, 196, 0.4);
+  border-radius: var(--r-sm);
+  color: var(--teal);
+  background: var(--teal-soft);
+}
+.sk-monk-title {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.sk-monk-title b {
+  font: 600 13px/1.2 var(--font-ui);
+  color: var(--navy-50, #e8f2fb);
+}
+.sk-monk-title small {
+  font: 500 10.5px/1.3 var(--font-ui);
+  color: rgba(169, 194, 220, 0.72);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sk-spread {
+  flex: 1;
+}
+.sk-monk-lang select {
+  height: 28px;
+  padding: 0 6px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--r-xs);
+  background: var(--ink-3);
+  color: var(--neutral-fg);
+  font: 600 11px/1 var(--font-ui);
+  cursor: pointer;
+}
+.sk-monk-head .sk-iconbtn {
+  width: 28px;
+  height: 28px;
+}
+.sk-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+
+.sk-monk-prompts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.sk-monk-prompts button {
+  padding: 4px 9px;
+  border: 1px solid var(--line-hair);
+  border-radius: 999px;
+  background: rgba(51, 185, 242, 0.07);
+  color: var(--info-fg);
+  font: 500 10.5px/1.3 var(--font-ui);
+  cursor: pointer;
+}
+.sk-monk-prompts button:hover:not(:disabled) {
+  border-color: rgba(51, 185, 242, 0.45);
+  background: var(--info-bg);
+}
+.sk-monk-prompts button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.sk-monk-log {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.sk-monk-empty {
+  margin: auto;
+  padding: 0 18px;
+  text-align: center;
+}
+.sk-monk-empty p {
+  margin: 0 0 8px;
+  font: 500 12.5px/1.55 var(--font-ui);
+  color: var(--neutral-fg);
+}
+.sk-monk-empty small {
+  font: 400 10.5px/1.5 var(--font-ui);
+  color: rgba(169, 194, 220, 0.6);
+}
+
+.sk-monk-msg {
+  max-width: 92%;
+  padding: 8px 11px;
+  border-radius: var(--r-md);
+  font: 400 12.5px/1.55 var(--font-ui);
+  overflow-wrap: anywhere;
+}
+.sk-monk-msg.user {
+  align-self: flex-end;
+  background: rgba(51, 185, 242, 0.16);
+  border: 1px solid var(--info-line);
+  color: #cdeafc;
+  border-bottom-right-radius: 4px;
+}
+.sk-monk-msg.assistant {
+  align-self: flex-start;
+  background: var(--ink-raised);
+  border: 1px solid var(--line-hair);
+  color: #d7e6f5;
+  border-bottom-left-radius: 4px;
+}
+.sk-monk-msg.is-error {
+  border-color: var(--danger-line);
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+}
+.sk-monk-md h3,
+.sk-monk-md h4 {
+  margin: 7px 0 3px;
+  font: 600 11px/1.35 var(--font-cond);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--teal);
+}
+.sk-monk-md h3:first-child,
+.sk-monk-md h4:first-child {
+  margin-top: 0;
+}
+.sk-monk-md p {
+  margin: 3px 0;
+}
+.sk-monk-md ul {
+  margin: 3px 0 3px 16px;
+  padding: 0;
+}
+.sk-monk-md li {
+  margin: 2px 0;
+}
+.sk-monk-md hr {
+  border: none;
+  border-top: 1px solid var(--line-soft);
+  margin: 8px 0;
+}
+.sk-monk-md b {
+  color: #eaf4fd;
+}
+
+.sk-monk-conf {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 7px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font: 600 10px/1.4 var(--font-ui);
+  cursor: help;
+}
+.sk-monk-conf i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.sk-monk-conf[data-label="high"] {
+  color: var(--ok-fg);
+  background: var(--ok-bg);
+  border: 1px solid var(--ok-line);
+}
+.sk-monk-conf[data-label="moderate"] {
+  color: var(--warn-fg);
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-line);
+}
+.sk-monk-conf[data-label="low"] {
+  color: var(--danger-fg);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-line);
+}
+
+.sk-monk-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  align-self: flex-start;
+  padding: 6px 11px;
+  border: 1px dashed var(--line-hair);
+  border-radius: var(--r-md);
+  font: 500 11px/1.4 var(--font-ui);
+  color: rgba(169, 194, 220, 0.75);
+}
+.sk-monk-spinner {
+  width: 11px;
+  height: 11px;
+  border: 1.6px solid var(--teal);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: skSpin 0.9s linear infinite;
+}
+
+.sk-monk-input {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--line-hair);
+  background: rgba(7, 26, 46, 0.72);
+}
+.sk-monk-input input {
+  flex: 1;
+  height: 34px;
+  padding: 0 11px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--r-sm);
+  background: var(--ink-3);
+  color: var(--navy-50, #e8f2fb);
+  font: 400 12.5px/1 var(--font-ui);
+  outline: none;
+}
+.sk-monk-input input:focus {
+  border-color: rgba(46, 196, 196, 0.55);
+}
+.sk-monk-input input::placeholder {
+  color: rgba(169, 194, 220, 0.45);
+}
+.sk-monk-send {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: var(--teal);
+  color: #04202c;
+  cursor: pointer;
+}
+.sk-monk-send:hover:not(:disabled) {
+  background: #45d2d2;
+}
+.sk-monk-send:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+@media (max-width: 720px) {
+  #sk-monk-panel {
+    right: 10px;
+    bottom: 10px;
+  }
+  .sk-monk {
+    width: calc(100vw - 20px);
+    height: min(70vh, 540px);
+  }
+  .sk-monk-launch span {
+    display: none;
+  }
+  .sk-monk-launch {
+    padding: 0 9px;
+    height: 34px;
+    width: 34px;
+    justify-content: center;
+  }
+}
+
+@media print {
+  .sk-monk,
+  .sk-monk-launch {
+    display: none !important;
+  }
+}

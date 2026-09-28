@@ -20,7 +20,7 @@ from typing import Any, AsyncIterator, TypedDict
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from app.llm import chat_json, chat_markdown, chat_markdown_stream
+from app.llm import LLMError, chat_json, chat_markdown, chat_markdown_stream
 from app.services import advisory, community, confidence, geospatial, incois, weather
 
 # ---------------------------------------------------------------- state
@@ -33,6 +33,7 @@ class AgentState(TypedDict, total=False):
     pfz_data: dict[str, Any] | None
     advisory_data: dict[str, Any] | None
     community_data: dict[str, Any] | None
+    feed_errors: list[str]
     confidence: dict[str, Any] | None
     map_features: dict[str, Any] | None
     response: str
@@ -102,6 +103,11 @@ async def router_node(state: AgentState) -> dict:
             intent = "hazard_check"
         elif any(w in msg for w in ("weather", "wave", "wind", "cyclone")):
             intent = "weather"
+        elif "fish" in msg or "safe" in msg:
+            # Safety/fishing question without coordinates: the PFZ bulletin
+            # path pulls zones + advisories + community, which is the most
+            # useful real-data answer we can give.
+            intent = "pfz_search"
     return {"intent": intent, "coordinates": coords}
 
 
@@ -243,10 +249,130 @@ def _context(state: AgentState) -> str:
     return "\n".join(parts)
 
 
+def _compass(deg: float | None) -> str:
+    if deg is None:
+        return ""
+    dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+    return dirs[int((deg % 360) / 22.5) % 16]
+
+
+def _sea_verdict(wave_m: float | None, gusts_kmh: float | None) -> str:
+    """Plain-language verdict from observed values — same thresholds the
+    dashboard console uses, so the chat never contradicts the map."""
+    wave = wave_m if wave_m is not None else 99
+    gust = gusts_kmh if gusts_kmh is not None else 0
+    if wave < 1.5 and gust < 25:
+        return "**Favourable** — small craft can work the nearshore grounds."
+    if wave <= 2.5 and gust <= 40:
+        return "**Workable with caution** — larger vessels OK; small craft keep to sheltered water."
+    return "**Poor** — advise staying in harbour until the sea settles."
+
+
+def _fmt_conditions(w: dict) -> list[str]:
+    kt = lambda v: round(v / 1.852) if isinstance(v, (int, float)) else None
+    wind, gusts = kt(w.get("wind_speed_kmh")), kt(w.get("wind_gusts_kmh"))
+    lines = []
+    if wind is not None:
+        g = f", gusting {gusts} kt" if gusts else ""
+        lines.append(f"- Wind: **{wind} kt**{g}")
+    wave = w.get("wave_height_m")
+    if wave is not None:
+        per = w.get("wave_period_s")
+        d = _compass(w.get("wave_direction_deg"))
+        lines.append(f"- Waves: **{wave} m**" + (f" at {per} s" if per else "") + (f" from {d}" if d else ""))
+    sst = w.get("sea_surface_temperature_c")
+    if sst is not None:
+        lines.append(f"- Sea surface: **{sst} °C**" + (f" · air {w['air_temperature_c']} °C" if w.get("air_temperature_c") is not None else ""))
+    if w.get("weather"):
+        lines.append(f"- Sky: {w['weather']}")
+    return lines
+
+
+def _fallback_answer(state: AgentState, partial: str = "") -> str:
+    """Compose the answer straight from the live feeds the workers gathered.
+
+    Used when the LLM provider is unreachable (quota exhausted, outage). Every
+    number here comes from an observed/model feed — nothing is invented — and
+    the answer says so, in one quiet line, without losing its authority.
+    """
+    c = state.get("coordinates") or {}
+    where = f"{c['lat']:.2f}°N, {c['lon']:.2f}°E" if c else "your area"
+    sections: list[str] = [f"**Feed brief for {where}**"]
+
+    w = state.get("weather_data")
+    if w:
+        cond = _fmt_conditions(w)
+        if cond:
+            sections += ["### Observed conditions — Open-Meteo", *cond,
+                         "", "→ " + _sea_verdict(w.get("wave_height_m"), w.get("wind_gusts_kmh"))]
+
+    g = state.get("geospatial_data") or {}
+    if g.get("checked"):
+        zones = g.get("zones") or []
+        if zones:
+            z = zones[0]
+            sections += ["", "### ⚠️ Hazard geofence — PostGIS",
+                         f"This point is **inside recorded hazard zone “{z.get('name')}” (severity {z.get('severity')}). DO NOT venture here.** {z.get('advisory') or ''}".strip()]
+        else:
+            sections += ["", "### Hazard geofence — PostGIS",
+                         "✅ No recorded hazard zone at this location."]
+
+    p = state.get("pfz_data")
+    if p:
+        feats = (p.get("geojson") or {}).get("features") or []
+        rows = []
+        for f in feats[:4]:
+            pr = f.get("properties") or {}
+            name = pr.get("location_name") or pr.get("name") or "zone"
+            prob = pr.get("probability")
+            rows.append(f"{name}" + (f" ({prob}% likelihood)" if isinstance(prob, (int, float)) else ""))
+        if rows:
+            sections += ["", f"### Fishing zones — INCOIS bulletin ({p.get('zone_count', len(feats))} active)",
+                         "· " + "\n· ".join(rows)]
+
+    a = state.get("advisory_data") or {}
+    for m in (a.get("matches") or [])[:2]:
+        if m.get("title"):
+            content = (m.get("content") or "").strip()[:220]
+            sections += ["", f"### Advisory — {m.get('category') or 'general'}",
+                         f"**{m['title']}**" + (f": {content}…”" if len(m.get("content") or "") > 220 else (f": {content}" if content else ""))]
+
+    cd = state.get("community_data") or {}
+    reports = [r for r in (cd.get("reports") or [])]
+    if reports:
+        trusted = [r for r in reports if r.get("verified")]
+        r0 = (trusted or reports)[0]
+        tag = "sensor-verified" if r0.get("verified") else "unverified"
+        sections += ["", f"### Community reports ({len(reports)} near, {len(trusted)} verified)",
+                     f"“{(r0.get('description') or '')[:160]}” — {tag}, {r0.get('observed_at') or 'recent'}"]
+
+    drawn = []
+    if (g.get("geojson") or {}).get("features"):
+        drawn.append("hazard zones in red")
+    if (p or {}).get("geojson", {}).get("features"):
+        drawn.append("PFZ polygons in green")
+    if reports:
+        drawn.append("community pins in cyan")
+    sections += ["", "🛰️ Map: " + (" and ".join(drawn) + " drawn on the chart." if drawn else "nothing to draw for this question.")]
+
+    feed_errors = state.get("feed_errors") or []
+    if feed_errors:
+        sections += ["", "⚠️ " + f"{len(feed_errors)} live feed(s) could not be reached just now, so this brief covers only what answered."]
+
+    if partial:
+        sections = [partial, "", "---", *sections]
+    sections += ["", "_Assembled directly from the platform's live feeds — the AI writer is temporarily unavailable, so no number here is paraphrased._"]
+    return "\n".join(sections)
+
+
 async def synthesize_node(state: AgentState) -> dict:
-    """gpt-4o markdown answer. Provider failures propagate — never faked."""
+    """gpt-4o markdown answer; falls back to a live-feed brief when the
+    provider is down (quota/outage) so the Monk still answers from real data."""
     map_features = _merge_features(state)
-    response = await chat_markdown(SYNTH_SYS, _context(state))
+    try:
+        response = await chat_markdown(SYNTH_SYS, _context(state))
+    except LLMError:
+        response = _fallback_answer(state)
     # Trimmed payload: the big geojson blobs are already merged into
     # map_features, so drop the per-worker duplicates from the state.
     return {"response": response, "map_features": map_features}
@@ -256,14 +382,29 @@ async def synthesize_stream_node(state: AgentState):
     """Streaming twin of synthesize_node for SSE.
 
     Yields ('__token__', str) chunks as the LLM generates, then a final
-    ('result', dict) state update. Provider errors propagate to the caller so
-    the UI receives a genuine failure instead of a fabricated report.
+    ('result', dict) state update. If the provider fails mid-run the answer
+    is completed from the live-feed brief instead of leaving the user with
+    a dead stream.
     """
     map_features = _merge_features(state)
     response = ""
-    async for token in chat_markdown_stream(SYNTH_SYS, _context(state)):
-        response += token
-        yield ("__token__", token)
+    try:
+        async for token in chat_markdown_stream(SYNTH_SYS, _context(state)):
+            response += token
+            yield ("__token__", token)
+    except LLMError:
+        # Provider down (quota exhausted / outage): complete the answer from
+        # the feeds already gathered — never a fabricated report, only real
+        # observed/model values, and the brief says where it came from.
+        brief = _fallback_answer(state)
+        tail = brief.split("\n\n---\n", 1)[-1]
+        if response:
+            separator = "\n\n---\n"
+            yield ("__token__", separator + tail)
+            response = response + separator + tail
+        else:
+            yield ("__token__", brief)
+            response = brief
     yield "result", {"response": response, "map_features": map_features}
 
 
@@ -300,10 +441,18 @@ async def run_chat_stream(message: str) -> AsyncIterator[tuple[str, dict | str]]
     async def _run(name: str):
         return name, await _STREAM_NODE_MAP[name](payload)
 
+    # One dead feed must not kill the answer: record the failure and answer
+    # from whichever feeds did respond (or say plainly that none did).
+    feed_errors: list[str] = []
     for coro in asyncio.as_completed([_run(t) for t in tasks]):
-        name, delta = await coro
+        try:
+            name, delta = await coro
+        except Exception as exc:  # WeatherUnavailable, DB down, timeout…
+            feed_errors.append(f"{type(exc).__name__}: {exc}")
+            continue
         state.update(delta)
         yield _status(name)
+    state["feed_errors"] = feed_errors
 
     # Verification matrix + confidence scoring (out-of-band of the tokens).
     yield _status("verifying")
