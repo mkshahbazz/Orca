@@ -187,7 +187,10 @@ export function SeamonkDataProvider({ children }: { children: React.ReactNode })
       if (res.ok) {
         const data: ApiSnapshot = await res.json();
         if (data.status === "degraded") {
-          error = data.error ?? "the aggregation service reported a degraded run";
+          // Upstream errors can carry long request URLs (e.g. a rate-limited
+          // weather provider); keep the banner to a short human sentence.
+          const raw = String(data.error ?? "");
+          error = raw.length > 160 ? "a live feed is rate-limiting the aggregation service" : raw || "the aggregation service reported a degraded run";
           setApiSnapshot(null);
         } else {
           ok = true;
