@@ -26,6 +26,14 @@ MARINE_CURRENT = (
 )
 FORECAST_CURRENT = "temperature_2m,weather_code,wind_speed_10m,wind_gusts_10m"
 
+# Day-by-day outlook so follow-up questions ("what about tomorrow?") can be
+# answered for the same location instead of only the current hour.
+MARINE_DAILY = "wave_height_max,wave_direction_dominant,wave_period_max"
+FORECAST_DAILY = (
+    "temperature_2m_max,temperature_2m_min,wind_speed_10m_max,"
+    "wind_gusts_10m_max,weather_code,precipitation_probability_max"
+)
+
 WEATHER_CODES = {
     0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
     45: "Fog", 48: "Rime fog", 51: "Light drizzle", 53: "Drizzle",
@@ -33,9 +41,6 @@ WEATHER_CODES = {
     80: "Rain showers", 95: "Thunderstorm", 96: "Thunderstorm w/ hail",
     99: "Severe thunderstorm w/ hail",
 }
-
-_DEFAULT = {"lat": 13.0827, "lon": 80.2707}  # Chennai
-
 
 class WeatherUnavailable(RuntimeError):
     """Raised when live marine/weather data cannot be retrieved."""
@@ -89,6 +94,12 @@ async def startup() -> None:
     _ensure_client()
 
 
+def shared_client() -> httpx.AsyncClient:
+    """The process-wide pooled client — reused by the location resolver so the
+    platform keeps a single connection pool instead of one per module."""
+    return _ensure_client()
+
+
 async def shutdown() -> None:
     global _client
     if _client is not None:
@@ -100,14 +111,53 @@ def _round(v: float | None, nd: int = 1) -> float | None:
     return round(v, nd) if isinstance(v, (int, float)) else None
 
 
+def _daily(mj: dict, fj: dict) -> list[dict]:
+    """Join the marine + weather daily series into one day-by-day outlook."""
+    def index(d: dict) -> dict[str, int]:
+        return {day: i for i, day in enumerate(d.get("time") or [])}
+
+    def pick(d: dict, key: str, i: int, nd: int = 1):
+        col = d.get(key)
+        return _round(col[i], nd) if isinstance(col, list) and i < len(col) else None
+
+    mi, fi = index(mj), index(fj)
+    out: list[dict] = []
+    for day in sorted(set(mi) | set(fi)):
+        row: dict = {"date": day}
+        if day in mi:
+            i = mi[day]
+            row["wave_max_m"] = pick(mj, "wave_height_max", i)
+            row["wave_period_max_s"] = pick(mj, "wave_period_max", i)
+            row["wave_dir_deg"] = pick(mj, "wave_direction_dominant", i, 0)
+        if day in fi:
+            i = fi[day]
+            row["air_max_c"] = pick(fj, "temperature_2m_max", i)
+            row["air_min_c"] = pick(fj, "temperature_2m_min", i)
+            row["wind_max_kmh"] = pick(fj, "wind_speed_10m_max", i, 0)
+            row["gust_max_kmh"] = pick(fj, "wind_gusts_10m_max", i, 0)
+            row["rain_chance_pct"] = pick(fj, "precipitation_probability_max", i, 0)
+            code = pick(fj, "weather_code", i, 0)
+            row["weather"] = WEATHER_CODES.get(code, f"Code {code}") if code is not None else None
+        out.append(row)
+    return out
+
+
 async def get_marine_conditions(lat: float | None = None, lon: float | None = None) -> dict:
     """Live waves + SST (marine API) and wind/weather (forecast API).
+
+    Coordinates are REQUIRED. There is deliberately no default location: the
+    assistant must never answer for a place the user did not ask about, so a
+    missing location surfaces as :class:`WeatherUnavailable` and the caller
+    asks the user where they mean.
 
     Returns a trimmed payload (rounded floats, short keys) to cut JSON
     transit size between agent -> backend -> frontend.
     """
-    lat = lat if lat is not None else _DEFAULT["lat"]
-    lon = lon if lon is not None else _DEFAULT["lon"]
+    if lat is None or lon is None:
+        raise WeatherUnavailable(
+            "No location was resolved for this question, so live conditions "
+            "cannot be fetched for it."
+        )
 
     key = f"{round(float(lat), 2):.2f},{round(float(lon), 2):.2f}"
     hit = _cache_get(key)
@@ -116,9 +166,11 @@ async def get_marine_conditions(lat: float | None = None, lon: float | None = No
 
     params = {
         "marine": {"latitude": lat, "longitude": lon,
-                   "current": MARINE_CURRENT, "timezone": "auto"},
+                   "current": MARINE_CURRENT, "daily": MARINE_DAILY,
+                   "forecast_days": 3, "timezone": "auto"},
         "forecast": {"latitude": lat, "longitude": lon,
-                     "current": FORECAST_CURRENT, "timezone": "auto"},
+                     "current": FORECAST_CURRENT, "daily": FORECAST_DAILY,
+                     "forecast_days": 3, "timezone": "auto"},
     }
 
     client = _ensure_client()
@@ -130,8 +182,10 @@ async def get_marine_conditions(lat: float | None = None, lon: float | None = No
             )
             m_resp.raise_for_status()
             f_resp.raise_for_status()
-            mj = m_resp.json()["current"]
-            fj = f_resp.json()["current"]
+            m_body = m_resp.json()
+            f_body = f_resp.json()
+            mj = m_body["current"]
+            fj = f_body["current"]
     except Exception as exc:  # offline / rate-limited / timeout -> tell the truth
         raise WeatherUnavailable(
             f"Live weather/sea-state feeds could not be reached for "
@@ -153,6 +207,42 @@ async def get_marine_conditions(lat: float | None = None, lon: float | None = No
         # raw WMO code kept so downstream verification (community reports)
         # can reason about storms without parsing the human label
         "weather_code": fj.get("weather_code"),
+        # today + the two following days, so "what about tomorrow?" can be
+        # answered for the requested location from the same fetched payload
+        "forecast_days": _daily(m_body.get("daily") or {}, f_body.get("daily") or {}),
     }
     _cache_put(key, data)
     return dict(data, cached=False)
+
+
+async def probe_water_points(points: list[tuple[float, float]]) -> list[float | None]:
+    """Wave height at each candidate point, in ONE batched marine request.
+
+    Points over land come back as null. The location resolver uses this to put
+    a large-area question (a state, a bay) on real water instead of an inland
+    centre point. Never raises: an unreachable feed returns all-null and the
+    caller falls back to the feature centre.
+    """
+    if not points:
+        return []
+    params = {
+        "latitude": ",".join(f"{p[0]:.3f}" for p in points),
+        "longitude": ",".join(f"{p[1]:.3f}" for p in points),
+        "current": "wave_height",
+        "timezone": "auto",
+    }
+    try:
+        async with asyncio.timeout(10):
+            resp = await _ensure_client().get(MARINE_URL, params=params)
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception:
+        return [None] * len(points)
+
+    rows = payload if isinstance(payload, list) else [payload]
+    out: list[float | None] = []
+    for i in range(len(points)):
+        row = rows[i] if i < len(rows) and isinstance(rows[i], dict) else {}
+        value = (row.get("current") or {}).get("wave_height")
+        out.append(float(value) if isinstance(value, (int, float)) else None)
+    return out

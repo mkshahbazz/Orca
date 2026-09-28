@@ -10,6 +10,12 @@ Two-way translation: an inbound regional-language question is translated to
 English *before* the agents see it, and the English safety report is translated
 back to the user's language before it is shown.
 
+Follow-ups: `/api/chat` and `/api/chat/stream` accept two OPTIONAL extras —
+`history` (the last few turns) and `context` (the location the previous answer
+was for). Both are echoed back in the response so a client can round-trip them
+and ask "is the wind strong?" or "what about tomorrow?" without repeating the
+place. Clients that send only `{"message": ...}` behave exactly as before.
+
 Failure policy: provider/database failures are reported to the UI as a genuine
 `error` event. No fake weather report is fabricated anywhere.
 
@@ -93,11 +99,34 @@ app.add_middleware(
 )
 
 
+class HistoryTurn(BaseModel):
+    """One earlier turn of this conversation (optional)."""
+    role: str
+    content: str
+
+
+class ChatContext(BaseModel):
+    """Location resolved on the previous turn (optional).
+
+    Passing it back is what makes a follow-up ("is the wind strong?") stay on
+the same place instead of losing it.
+    """
+    location: str | None = None
+    lat: float | None = None
+    lon: float | None = None
+    scope: str | None = None
+    representative: bool = False
+
+
 class ChatRequest(BaseModel):
     message: str
     # Optional Bhashini ISO-639 code (hi/bn/ta/...). "en" (default) returns
     # the answer in English exactly as before — existing clients unaffected.
     language: str | None = None
+    # Optional follow-up support. Existing clients that send only
+    # {"message": "..."} are unaffected.
+    history: list[HistoryTurn] | None = None
+    context: ChatContext | None = None
 
 
 class ChatResponse(BaseModel):
@@ -109,6 +138,12 @@ class ChatResponse(BaseModel):
     # out-of-band self-assessment: {"score", "label", "justification", "factors"}
     confidence: dict | None = None
     community: dict | None = None
+    # the place these readings are for (label, lat, lon, scope, ...) — return it
+    # so the client can send it back as `context` on the next question
+    location: dict | None = None
+    # true when the question needed a location and none could be resolved, so
+    # the answer is a clarification question rather than a fabricated report
+    needs_location: bool = False
 
 
 EMPTY_FC = {"type": "FeatureCollection", "features": []}
@@ -200,7 +235,11 @@ async def chat(req: ChatRequest):
 
     final: dict = {}
     try:
-        async for kind, payload in run_chat_stream(message):
+        async for kind, payload in run_chat_stream(
+            message,
+            history=[t.model_dump() for t in req.history] if req.history else None,
+            context=req.context.model_dump() if req.context else None,
+        ):
             if kind == "final":
                 final = payload
     except Exception as exc:
@@ -230,6 +269,8 @@ async def chat(req: ChatRequest):
         language=target,
         confidence=final.get("confidence"),
         community=final.get("community"),
+        location=final.get("location"),
+        needs_location=bool(final.get("needs_location")),
     )
 
 
@@ -260,7 +301,11 @@ async def chat_stream(req: ChatRequest):
                     "label": STATUS_LABELS["routed"],
                 })
 
-            async for kind, payload in run_chat_stream(message):
+            async for kind, payload in run_chat_stream(
+                message,
+                history=[t.model_dump() for t in req.history] if req.history else None,
+                context=req.context.model_dump() if req.context else None,
+            ):
                 if kind == "final":
                     final = payload
                     answer = payload.get("response", "")
@@ -285,6 +330,10 @@ async def chat_stream(req: ChatRequest):
                         # confidence rides out-of-band and never enters the token stream
                         "confidence": payload.get("confidence"),
                         "community": payload.get("community"),
+                        # resolved place + follow-up flag, so the UI can carry the
+                        # location into the next question
+                        "location": payload.get("location"),
+                        "needs_location": bool(payload.get("needs_location")),
                     })
                 elif kind == "token":
                     # never stream English tokens when a translated answer is coming

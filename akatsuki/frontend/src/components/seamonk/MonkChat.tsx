@@ -22,6 +22,36 @@ export type MonkMessage = {
   mode?: "ai" | "feeds";
 };
 
+/** The place the previous answer covered, echoed back so a follow-up
+ * ("is the wind strong?", "what about tomorrow?") stays on it. */
+type MonkContext = {
+  location?: string | null;
+  lat?: number | null;
+  lon?: number | null;
+  scope?: string | null;
+  representative?: boolean;
+};
+
+const HISTORY_TURNS = 6;
+
+function buildHistory(messages: MonkMessage[]) {
+  return messages
+    .filter((m) => m.content && m.content !== "…")
+    .slice(-HISTORY_TURNS)
+    .map((m) => ({ role: m.role, content: m.content }));
+}
+
+function contextFrom(location: any): MonkContext | null {
+  if (!location) return null;
+  return {
+    location: location.label,
+    lat: location.lat,
+    lon: location.lon,
+    scope: location.scope,
+    representative: location.representative,
+  };
+}
+
 const QUICK_PROMPTS = [
   "Is it safe to fish near Digha today?",
   "Where are the best fishing zones right now?",
@@ -116,6 +146,8 @@ export function MonkChat({ open, onClose }: { open: boolean; onClose: () => void
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("");
   const [language, setLanguage] = useState("en");
+  // resolved location carried into the next question
+  const [chatContext, setChatContext] = useState<MonkContext | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -137,6 +169,8 @@ export function MonkChat({ open, onClose }: { open: boolean; onClose: () => void
 
   const send = useCallback(
     async (text: string, lang: string) => {
+      const history = buildHistory(messages);
+      const context = chatContext;
       setMessages((m) => [
         ...m,
         { role: "user", content: text },
@@ -168,6 +202,7 @@ export function MonkChat({ open, onClose }: { open: boolean; onClose: () => void
             setStatus(data.label);
           } else if (event === "final" && data) {
             if (data.confidence) confidence = data.confidence;
+            if (data.location) setChatContext(contextFrom(data.location));
             if (data.response) {
               updateLast({ content: data.response, confidence });
             }
@@ -205,7 +240,7 @@ export function MonkChat({ open, onClose }: { open: boolean; onClose: () => void
         const res = await fetch(`${API_URL}/api/chat/stream`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: text, language: lang }),
+          body: JSON.stringify({ message: text, language: lang, history, context }),
         });
         if (!res.ok) {
           const body = await res.json().catch(() => null);
@@ -216,6 +251,7 @@ export function MonkChat({ open, onClose }: { open: boolean; onClose: () => void
           await consumeSse(res);
         } else {
           const data = await res.json();
+          if (data.location) setChatContext(contextFrom(data.location));
           updateLast({ content: data.response ?? "", confidence: data.confidence ?? null });
         }
         if (serverError) showError(serverError, streamed);
@@ -225,13 +261,14 @@ export function MonkChat({ open, onClose }: { open: boolean; onClose: () => void
           const res = await fetch(`${API_URL}/api/chat`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message: text, language: lang }),
+            body: JSON.stringify({ message: text, language: lang, history, context }),
           });
           if (!res.ok) {
             const body = await res.json().catch(() => null);
             throw new Error(body?.detail || `the service replied ${res.status}`);
           }
           const data = await res.json();
+          if (data.location) setChatContext(contextFrom(data.location));
           updateLast({ content: data.response ?? "", confidence: data.confidence ?? null });
         } catch (err: any) {
           showError(err?.message || "the Monk could not be reached");
@@ -241,7 +278,7 @@ export function MonkChat({ open, onClose }: { open: boolean; onClose: () => void
         setLoading(false);
       }
     },
-    [updateLast]
+    [updateLast, messages, chatContext]
   );
 
   const submit = () => {

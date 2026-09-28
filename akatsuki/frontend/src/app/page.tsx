@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import dynamic from "next/dynamic";
 import {
   ArrowRight,
   ChevronDown,
@@ -9,21 +10,26 @@ import {
   Send,
   Waves,
 } from "lucide-react";
-import { OceanFX, WaveField } from "./oceanfx";
 import "./seamonk.css";
+import { SmoothScroll } from "@/components/hero/SmoothScroll";
+import { createHeroSignal } from "@/components/hero/signal";
 
 /**
  * THE SEAMONK — cinematic gateway ("Enter the Aquatic Realm").
  *
- * 1. Wide shot: a tiny meditating monk in a vast moonlit ocean under a
- *    twinkling starfield (matches the reference video's opening frame).
- * 2. Scroll / cursor-slide smoothly zooms the scene; the monk grows from a
- *    distance into the full-screen cinematic composition.
- * 3. At full zoom the gateway UI locks in (nav, title, assistant preview)
- *    and the CTA dives into the dashboard.
+ * The visual layer is a WebGL ocean environment (see components/hero). The page
+ * itself owns the single animation loop: it interpolates the scroll, tracks the
+ * pointer, drives the UI reveal (`--uiP`, `is-locked`) and hands the frame to the
+ * registered WebGL renderer. That means:
  *
- * Performance: one rAF loop drives everything through compositor-only
- * transforms / CSS variables on refs — zero React renders per frame.
+ *   * the composition, typography, navigation, buttons and copy are unchanged —
+ *     the artwork, the monk and the moon are the same, only now they live in a
+ *     scene with depth, moving water, drifting clouds and drifting stars;
+ *   * scrolling dives the camera through the scene and wakes the diamond;
+ *   * moving the pointer looks around inside the scene (a few degrees), rather
+ *     than sliding the page sideways;
+ *   * if WebGL is unavailable the original CSS artwork, rings and starfield take
+ *     over and the page behaves exactly as before.
  */
 
 const GATEWAY_QUESTIONS = [
@@ -32,6 +38,13 @@ const GATEWAY_QUESTIONS = [
   "Show today's marine forecast",
 ];
 
+const HeroScene = dynamic(() => import("@/components/hero/HeroScene"), {
+  ssr: false,
+});
+
+const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+
+/** CSS fallback starfield — only rendered when WebGL is unavailable. */
 function Starfield() {
   const ref = useRef<HTMLCanvasElement | null>(null);
 
@@ -45,6 +58,7 @@ function Starfield() {
     let w = 0;
     let h = 0;
     const DPR = Math.min(2, window.devicePixelRatio || 1);
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
     type Star = { x: number; y: number; r: number; tw: number; ph: number };
     let stars: Star[] = [];
@@ -53,7 +67,7 @@ function Starfield() {
       const count = Math.min(340, Math.floor((w * h) / 5200));
       stars = Array.from({ length: count }, () => ({
         x: Math.random() * w,
-        y: Math.random() * h * 0.5,
+        y: Math.random() * h * 0.72,
         r: Math.random() * 1.25 + 0.3,
         tw: Math.random() * 1.6 + 0.4,
         ph: Math.random() * Math.PI * 2,
@@ -70,9 +84,7 @@ function Starfield() {
     };
 
     let t = 0;
-    let visible = !document.hidden;
     const draw = () => {
-      if (!visible) return; // pause starlight while the tab is hidden
       t += 0.016;
       ctx.clearRect(0, 0, w, h);
       for (const s of stars) {
@@ -95,16 +107,10 @@ function Starfield() {
 
     resize();
     raf = requestAnimationFrame(draw);
-    const onVis = () => {
-      visible = !document.hidden;
-      if (visible) raf = requestAnimationFrame(draw);
-    };
     window.addEventListener("resize", resize);
-    document.addEventListener("visibilitychange", onVis);
     return () => {
       cancelAnimationFrame(raf);
       window.removeEventListener("resize", resize);
-      document.removeEventListener("visibilitychange", onVis);
     };
   }, []);
 
@@ -115,102 +121,123 @@ export default function SeamonkLanding() {
   const router = useRouter();
 
   const stageRef = useRef<HTMLDivElement | null>(null);
-  const bgRef = useRef<HTMLDivElement | null>(null);
-  const ringsRef = useRef<HTMLDivElement | null>(null);
   const hintRef = useRef<HTMLDivElement | null>(null);
+  const signal = useRef(createHeroSignal().current);
+  const [webgl, setWebgl] = useState<boolean | null>(null);
 
-  const target = useRef(0);
-  const current = useRef(0);
-  const scrollMax = useRef(1);
+  // stable identity: a new callback would remount the WebGL scene
+  const handleSceneStatus = useCallback((available: boolean) => {
+    setWebgl(available);
+  }, []);
 
   useEffect(() => {
     const stage = stageRef.current;
-    const bg = bgRef.current;
-    const rings = ringsRef.current;
+    if (!stage) return;
     const hint = hintRef.current;
-    if (!stage || !bg || !rings || !hint) return;
 
-    const reduceMotion = window.matchMedia(
-      "(prefers-reduced-motion: reduce)"
-    ).matches;
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const smooth = new SmoothScroll({ disabled: reduceMotion });
+    smooth.attach();
 
     const pointer = { x: 0.5, y: 0.5 };
     let scrollP = 0;
     let cursorP = 0;
+    let current = 0;
+    let target = 0;
+    let maxScroll = 1;
+    let raf = 0;
+    let last = performance.now();
+
+    // Cursor-slide acts as a latch: moving the cursor down the viewport reveals
+    // the gateway UI; scrolling still drives the dive either way.
+    const canHover = window.matchMedia("(hover: hover) and (pointer: fine)");
 
     const apply = (p: number) => {
       const eased = p * p * (3 - 2 * p); // smoothstep
-      const scale = 1 + 0.46 * eased;
-      const parallax = 1 - eased;
-      const mx = (pointer.x - 0.5) * 18 * parallax;
-      const my =
-        (pointer.y - 0.5) * 14 * parallax - eased * window.innerHeight * 0.03;
-      bg.style.transform = `translate3d(${mx.toFixed(2)}px, ${my.toFixed(2)}px, 0) scale(${scale.toFixed(4)})`;
-      // Water leans subtly toward the cursor (consumed by .gw-oceanfx).
-      bg.style.setProperty("--fxLean", `${((pointer.x - 0.5) * 14 * parallax).toFixed(2)}px`);
+      const uiP = clamp01((p - 0.7) / 0.3);
+      const ringP = clamp01((p - 0.3) / 0.45);
 
-      const ringP = Math.max(0, Math.min(1, (p - 0.3) / 0.45));
-      rings.style.opacity = ringP.toFixed(3);
-      rings.style.transform = `translate(-50%, -50%) scale(${(0.8 + 0.2 * ringP).toFixed(4)})`;
-
-      const uiP = Math.max(0, Math.min(1, (p - 0.7) / 0.3));
       stage.style.setProperty("--uiP", uiP.toFixed(3));
+      stage.style.setProperty("--ringP", ringP.toFixed(3));
       stage.classList.toggle("is-locked", uiP >= 0.98);
 
-      hint.style.opacity = Math.max(0, 1 - p * 1.6).toFixed(3);
+      // CSS fallback only (the WebGL scene reads the progress directly)
+      const parallax = 1 - eased;
+      stage.style.setProperty("--zoom", (1 + 0.46 * eased).toFixed(4));
+      stage.style.setProperty("--bgx", `${((pointer.x - 0.5) * 18 * parallax).toFixed(2)}px`);
+      stage.style.setProperty(
+        "--bgy",
+        `${(
+          (pointer.y - 0.5) * 14 * parallax -
+          eased * window.innerHeight * 0.03
+        ).toFixed(2)}px`
+      );
+
+      if (hint) hint.style.opacity = Math.max(0, 1 - p * 1.6).toFixed(3);
     };
 
-    if (reduceMotion) {
-      apply(1);
-      return;
-    }
-
     const measure = () => {
-      scrollMax.current = Math.max(
-        1,
-        document.documentElement.scrollHeight - window.innerHeight
+      maxScroll = Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
+    };
+
+    const onPointerMove = (event: PointerEvent) => {
+      pointer.x = event.clientX / window.innerWidth;
+      pointer.y = event.clientY / window.innerHeight;
+      if (canHover.matches) {
+        cursorP = clamp01((pointer.y - 0.15) / 0.6);
+      }
+    };
+
+    const tick = (now: number) => {
+      raf = requestAnimationFrame(tick);
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+
+      smooth.step();
+
+      // Poll scrollY directly — immune to missed/coalesced scroll events.
+      scrollP = Math.min(1, window.scrollY / maxScroll);
+      target = Math.max(scrollP, cursorP);
+      const next = current + (target - current) * 0.09;
+      current = Math.abs(target - next) < 0.0004 ? target : next;
+
+      apply(current);
+
+      signal.current.renderer?.(
+        now / 1000,
+        dt,
+        current,
+        (pointer.x - 0.5) * 2,
+        (0.5 - pointer.y) * 2
       );
     };
 
-    // Cursor-slide acts as a latch (moving the cursor down the viewport
-    // advances the zoom; scrolling still reverses it naturally).
-    const canHover = window.matchMedia("(hover: hover) and (pointer: fine)");
-    const onPointerMove = (e: PointerEvent) => {
-      pointer.x = e.clientX / window.innerWidth;
-      pointer.y = e.clientY / window.innerHeight;
-      if (canHover.matches) {
-        cursorP = Math.max(0, Math.min(1, (pointer.y - 0.15) / 0.6));
+    const onVisibility = () => {
+      if (document.hidden) {
+        cancelAnimationFrame(raf);
+        raf = 0;
+      } else if (!raf) {
+        last = performance.now();
+        raf = requestAnimationFrame(tick);
       }
-    };
-
-    let raf = 0;
-    let lastY = -1;
-    const tick = () => {
-      // Poll scrollY directly — immune to missed/coalesced scroll events.
-      const y = window.scrollY;
-      if (y !== lastY) {
-        lastY = y;
-        scrollP = Math.min(1, y / scrollMax.current);
-        target.current = Math.max(scrollP, cursorP);
-      }
-      const next = current.current + (target.current - current.current) * 0.09;
-      current.current =
-        Math.abs(target.current - next) < 0.0004 ? target.current : next;
-      apply(current.current);
-      raf = requestAnimationFrame(tick);
     };
 
     measure();
-    apply(current.current);
+    apply(current);
     raf = requestAnimationFrame(tick);
 
     window.addEventListener("resize", measure);
+    window.addEventListener("orientationchange", measure);
     window.addEventListener("pointermove", onPointerMove, { passive: true });
+    document.addEventListener("visibilitychange", onVisibility);
 
     return () => {
       cancelAnimationFrame(raf);
+      smooth.detach();
       window.removeEventListener("resize", measure);
+      window.removeEventListener("orientationchange", measure);
       window.removeEventListener("pointermove", onPointerMove);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, []);
 
@@ -220,26 +247,17 @@ export default function SeamonkLanding() {
     <div className="landing">
       <div className="gw-track">
         <div className="gw-stage" ref={stageRef}>
-          {/* The living ocean: FX layers are children of the transformed
-              stage so they zoom/parallax in perfect registration with the
-              hero photo (all trapped inside gw-bg's z-band, under the UI).
-              The starfield uses screen blending to add light over the
-              photo's night sky — impossible from behind an opaque JPEG. */}
-          <div className="gw-bg" ref={bgRef} aria-hidden="true">
-            <div className="gw-starfx">
-              <Starfield />
-            </div>
-            <WaveField />
-            <OceanFX />
-            <div className="gw-moonbloom" />
-            <span className="gw-meteor m1" />
-            <span className="gw-meteor m2" />
-            <span className="gw-meteor m3" />
+          <div className="gw-stars" aria-hidden="true">
+            {webgl === false && <Starfield />}
           </div>
+          <div className="gw-bg" aria-hidden="true" />
           <div className="gw-ocean-glow" aria-hidden="true" />
+
+          <HeroScene signal={signal} onStatus={handleSceneStatus} />
+
           <div className="gw-shade" aria-hidden="true" />
 
-          <div className="gw-rings" ref={ringsRef} aria-hidden="true">
+          <div className="gw-rings" aria-hidden="true">
             <div className="gw-ring gw-ring-outer" />
             <div className="gw-ring gw-ring-mid" />
             <div className="gw-ring gw-ring-inner" />

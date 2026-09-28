@@ -31,11 +31,33 @@ interface MapFeatureCollection {
   features: unknown[];
 }
 
+/** The location the previous answer was for, echoed back so a follow-up like
+ * "is the wind strong?" stays on the same place. Sent as `context`. */
+interface ChatContext {
+  location?: string | null;
+  lat?: number | null;
+  lon?: number | null;
+  scope?: string | null;
+  representative?: boolean;
+}
+
+/** How many recent turns are sent so the backend can follow the conversation. */
+const HISTORY_TURNS = 6;
+
+function buildHistory(messages: ChatMessage[]) {
+  return messages
+    .filter((m) => m.content && m.content !== "\u2026")
+    .slice(-HISTORY_TURNS)
+    .map((m) => ({ role: m.role, content: m.content }));
+}
+
 export default function MarineChatApp() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("");
   const [language, setLanguage] = useState("en");
+  // resolved location carried into the next question
+  const [chatContext, setChatContext] = useState<ChatContext | null>(null);
   const [mapFeatures, setMapFeatures] = useState<MapFeatureCollection | null>(
     null
   );
@@ -50,6 +72,8 @@ export default function MarineChatApp() {
 
   const sendMessage = useCallback(
     async (text: string, lang: string = "en") => {
+      const history = buildHistory(messages);
+      const context = chatContext;
       setMessages((m) => [...m, { role: "user", content: text }]);
       setLoading(true);
       setStatus("Contacting the marine intelligence service…");
@@ -99,6 +123,16 @@ export default function MarineChatApp() {
             if (data.label) setStatus(data.label);
           } else if (event === "final" && data) {
             if (data.confidence) confidence = data.confidence;
+            if (data.location) {
+              // keep the resolved place for the next question (follow-ups)
+              setChatContext({
+                location: data.location.label,
+                lat: data.location.lat,
+                lon: data.location.lon,
+                scope: data.location.scope,
+                representative: data.location.representative,
+              });
+            }
             if (data.response && !streamed) {
               // translated answers arrive whole (English tokens are withheld)
               updateLast(data.response, confidence);
@@ -141,7 +175,7 @@ export default function MarineChatApp() {
         const res = await fetch(`${API_URL}/api/chat/stream`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: text, language: lang }),
+          body: JSON.stringify({ message: text, language: lang, history, context }),
         });
 
         if (!res.ok) {
@@ -157,6 +191,14 @@ export default function MarineChatApp() {
           // non-streaming payload (older backend, proxies, unexpected body)
           const data = await res.json();
           updateLast(data.response ?? "", data.confidence ?? null);
+          if (data.location)
+            setChatContext({
+              location: data.location.label,
+              lat: data.location.lat,
+              lon: data.location.lon,
+              scope: data.location.scope,
+              representative: data.location.representative,
+            });
           if (data.map_features?.features?.length)
             features = data.map_features;
         }
@@ -177,7 +219,7 @@ export default function MarineChatApp() {
             const res = await fetch(`${API_URL}/api/chat`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: text, language: lang }),
+              body: JSON.stringify({ message: text, language: lang, history, context }),
             });
             if (!res.ok) {
               const body = await res.json().catch(() => null);
@@ -200,7 +242,7 @@ export default function MarineChatApp() {
         setLoading(false);
       }
     },
-    [appendAssistant]
+    [appendAssistant, messages, chatContext]
   );
 
   return (

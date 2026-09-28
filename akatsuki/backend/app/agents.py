@@ -1,6 +1,7 @@
 """LangGraph multi-agent DAG.
 
 Flow: START -> router (LLM intent classification)
+           -> resolve_location (place name -> coordinates; no gazetteer)
            -> conditional edge returns [Send(...)] -> parallel specialist nodes
            -> verify (community corroboration + confidence scoring)
            -> synthesize (gpt-4o markdown) -> END
@@ -12,6 +13,15 @@ Two payloads leave this module and they never touch each other:
   * `response`   — the conversational markdown, streamed token-by-token;
   * `confidence` — the self-assessment (score + one-line justification) which is
     returned as a separate field so it cannot interrupt the typing stream.
+
+Ordinary conversation is a first-class intent (`conversation`). It fans out to
+*no* worker at all, so a greeting never touches a weather feed, a spatial query
+or the PFZ bulletin — and it is answered by the conversational prompt rather
+than a marine brief.
+
+Follow-ups work because the caller may pass the last few turns (`history`) plus
+the location resolved last time (`context`). The router sees both, so "is the
+wind strong?" after a Chennai answer is understood as Chennai.
 """
 import asyncio
 import re
@@ -21,12 +31,26 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 from app.llm import LLMError, chat_json, chat_markdown, chat_markdown_stream
-from app.services import advisory, community, confidence, geospatial, incois, weather
+from app.services import advisory, community, confidence, geospatial, incois, location, weather
 
 # ---------------------------------------------------------------- state
 class AgentState(TypedDict, total=False):
     message: str
     intent: str
+    # last few turns of the conversation, oldest first: [{role, content}]
+    history: list[dict]
+    # location carried over from the previous turn of this conversation
+    prior_location: dict | None
+    # place name the router pulled out of the message
+    location_query: str | None
+    # the resolved location: {label, display_name, lat, lon, scope, ...}
+    location: dict | None
+    is_followup: bool
+    # a marine question that names no location (or names one we cannot resolve)
+    needs_location: bool
+    unresolved_location: str | None
+    too_broad: bool
+    conversation: bool
     coordinates: dict[str, float] | None
     weather_data: dict[str, Any] | None
     geospatial_data: dict[str, Any] | None
@@ -38,18 +62,31 @@ class AgentState(TypedDict, total=False):
     map_features: dict[str, Any] | None
     response: str
 
-INTENTS = ("weather", "pfz_search", "hazard_check", "general_advisory")
 
-# intent -> workers to fan out to (every intent maps to >= 1 worker)
+INTENTS = ("weather", "pfz_search", "hazard_check", "general_advisory", "conversation")
+
+# Intents that cannot be answered without a point on the map. A question in one
+# of these with no location gets a clarification question, never a guess.
+LOCATION_INTENTS = ("weather", "hazard_check")
+
+# intent -> workers to fan out to. `_tasks_for` prunes the point-dependent ones
+# when no location is available. Conversation deliberately maps to nothing.
 TASK_MAP = {
+    "conversation": [],
     "weather":        ["weather", "community"],
-    "pfz_search":     ["pfz", "advisory", "community", "weather_lenient"],        "hazard_check":   ["geospatial", "weather", "advisory", "community"],
+    "pfz_search":     ["pfz", "advisory", "community", "weather_lenient"],
+    "hazard_check":   ["geospatial", "weather", "advisory", "community"],
     "general_advisory": ["advisory", "weather_lenient"],
 }
+
+# Workers that are meaningless without a resolved coordinate.
+_POINT_WORKERS = {"weather", "weather_lenient", "geospatial", "community"}
 
 # Human-readable milestones the UI shows while it waits (live status transparency).
 STATUS_LABELS = {
     "routed": "Understanding your question…",
+    "locating": "Locating the area you asked about…",
+    "chatting": "Thinking…",
     "weather": "Checking weather buoys…",
     "geospatial": "Checking hazard zones…",
     "pfz": "Fetching the PFZ bulletin…",
@@ -57,7 +94,7 @@ STATUS_LABELS = {
     "weather_lenient": "Checking weather buoys…",
     "community": "Scanning community reports…",
     "verifying": "Cross-checking human reports against live sensors…",
-    "synthesizing": "Writing safety report…",
+    "synthesizing": "Writing the answer…",
 }
 
 _COORD_RE = re.compile(
@@ -66,14 +103,43 @@ _COORD_RE = re.compile(
 
 # ---------------------------------------------------------------- router
 ROUTER_SYS = (
-    "You are the intent router of a marine safety assistant. Reply with JSON only: "
-    '{"intent": "<one of weather|pfz_search|hazard_check|general_advisory>", '
-    '"lat": <number|null>, "lon": <number|null>}. '
-    "Extract coordinates from text like '16.0, 86.5', '16N 86.5E', 'lat 16 lon 86.5'. "
-    "Rules: fishing/safety/coordinates/boundary questions -> hazard_check; "
-    "waves/wind/weather/cyclone -> weather; PFZ/fishing zone/chlorophyll/SST -> pfz_search; "
-    "anything else (regulations, general advice) -> general_advisory."
+    "You are the intent router of THE SEAMONK, a marine intelligence assistant. "
+    "Reply with JSON only: "
+    '{"intent": "<weather|pfz_search|hazard_check|general_advisory|conversation>", '
+    '"location": "<place name or null>", "lat": <number|null>, "lon": <number|null>, '
+    '"followup": <true|false>}. '
+    "Choose the intent from what the user is actually asking for:\n"
+    "- conversation: ordinary talk — greetings, thanks, how are you, who are you, what can you "
+    "do, small talk, and general knowledge that is not about the sea at a place (e.g. 'what is "
+    "AI?'). Nothing about ocean or weather conditions is being asked for.\n"
+    "- weather: conditions, wind, waves, sea state, temperature, rain, storms, visibility, or a "
+    "forecast (today/tomorrow) for a place or coordinate.\n"
+    "- pfz_search: fishing zones, PFZ, where the fish are, chlorophyll, best fishing area.\n"
+    "- hazard_check: is it safe to fish/sail/venture, hazard zones, boundaries, or coordinates "
+    "the user wants checked.\n"
+    "- general_advisory: marine guidance that names no place and is not a location question "
+    "(monsoon advice, regulations, licences, general safety practice).\n"
+    "A greeting does NOT make a message conversational: 'Hi, what is the weather in Chennai?' is "
+    "a weather request, and 'Hello, is it safe to fish near Odisha today?' is a hazard_check. "
+    "Decide from the request inside the message.\n"
+    "location: the place the user is asking about, written as a plain place name ('Chennai', "
+    "'Kerala', 'Bay of Bengal', 'Digha', 'Kochi'). null when the message names no place of its "
+    "own. lat/lon: fill ONLY when the user gives explicit numeric coordinates (e.g. '16.0, 86.5' "
+    "or '16N 86.5E'); otherwise null.\n"
+    "followup: true when the message only makes sense against the previous turn (e.g. 'is the "
+    "wind strong?', 'what about tomorrow?', 'explain that', 'are they dangerous?') and names no "
+    "place of its own. false otherwise."
 )
+
+# Deterministic keyword sets used ONLY when the router LLM is unreachable, so the
+# assistant still classifies sanely instead of treating everything as marine.
+_MARINE_WORDS = (
+    "weather", "wave", "waves", "wind", "windy", "gust", "gusts", "swell", "sea", "seas",
+    "cyclone", "storm", "rain", "temperature", "forecast", "tide", "visibility", "monsoon",
+    "cloud", "cloudy", "rough", "calm",
+)
+_PFZ_WORDS = ("pfz", "fishing zone", "fish zone", "fish zones", "chlorophyll", "fish biting", "best fishing", "where are the fish")
+_SAFETY_WORDS = ("safe", "safety", "hazard", "danger", "dangerous", "risky", "venture", "sail", "boat", "boats", "trawler", "fish", "fishing")
 
 
 def _extract_coords(text: str) -> dict[str, float] | None:
@@ -83,42 +149,180 @@ def _extract_coords(text: str) -> dict[str, float] | None:
     return None
 
 
+def _last_turns(history: list[dict] | None, limit: int = 6, width: int = 600) -> list[dict]:
+    """Trim the conversation to the few recent turns a follow-up needs."""
+    out: list[dict] = []
+    for turn in (history or [])[-limit:]:
+        role = str(turn.get("role") or "")
+        content = str(turn.get("content") or "").strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        out.append({"role": role, "content": content[:width]})
+    return out
+
+
+def _router_input(state: AgentState) -> str:
+    """The router sees the previous turns and the location already in play."""
+    parts: list[str] = []
+    prior = state.get("prior_location") or {}
+    if prior.get("location") or prior.get("lat") is not None:
+        where = prior.get("location") or f"{prior.get('lat')}, {prior.get('lon')}"
+        parts.append(f"Location already established in this conversation: {where}")
+    turns = state.get("history") or []
+    if turns:
+        parts.append("Recent conversation (oldest first):")
+        parts += [f"{t['role']}: {t['content']}" for t in turns]
+    parts.append(f"New user message: {state['message']}")
+    return "\n".join(parts)
+
+
+def _heuristic_intent(message: str, coords: dict | None) -> tuple[str, str | None, bool]:
+    """Offline classifier used only when the router LLM fails. -> (intent, location, followup)"""
+    msg = message.lower()
+    if any(w in msg for w in _PFZ_WORDS):
+        return "pfz_search", None, False
+    if coords is not None:
+        return "hazard_check", None, False
+    if any(w in msg for w in _MARINE_WORDS):
+        if any(w in msg for w in _SAFETY_WORDS):
+            return "hazard_check", None, True
+        return "weather", None, True
+    if any(w in msg for w in _SAFETY_WORDS):
+        return "pfz_search", None, True
+    # Nothing marine was asked for: this is ordinary conversation, not a report.
+    return "conversation", None, False
+
+
 async def router_node(state: AgentState) -> dict:
-    """Classify intent + coordinates; fall back to heuristics if the LLM fails."""
+    """Classify intent, the named place, coordinates and follow-up-ness."""
     coords = _extract_coords(state["message"])
-    intent = "general_advisory"
+    intent = "conversation"
+    location_query: str | None = None
+    followup = False
     try:
-        out = await chat_json(ROUTER_SYS, state["message"])
+        out = await chat_json(ROUTER_SYS, _router_input(state))
         if out.get("intent") in INTENTS:
             intent = out["intent"]
+        name = out.get("location")
+        if isinstance(name, str) and name.strip() and name.strip().lower() not in ("null", "none"):
+            location_query = name.strip()
         if out.get("lat") is not None and out.get("lon") is not None:
-            coords = {"lat": float(out["lat"]), "lon": float(out["lon"])}
+            try:
+                coords = {"lat": float(out["lat"]), "lon": float(out["lon"])}
+            except (TypeError, ValueError):
+                pass
+        followup = bool(out.get("followup"))
     except Exception:
-        # Deterministic keyword parsing — not fabricated data, just a fallback
-        # classifier when the router LLM is unreachable.
-        msg = state["message"].lower()
-        if "pfz" in msg or "fish zone" in msg or "chlorophyll" in msg:
-            intent = "pfz_search"
-        elif coords and ("fish" in msg or "safe" in msg or "venture" in msg):
-            intent = "hazard_check"
-        elif any(w in msg for w in ("weather", "wave", "wind", "cyclone")):
-            intent = "weather"
-        elif "fish" in msg or "safe" in msg:
-            # Safety/fishing question without coordinates: the PFZ bulletin
-            # path pulls zones + advisories + community, which is the most
-            # useful real-data answer we can give.
-            intent = "pfz_search"
-    return {"intent": intent, "coordinates": coords}
+        intent, location_query, followup = _heuristic_intent(state["message"], coords)
+        # No place name is mined from the text without the model: a location must
+        # come from the user's own words or from the conversation, never a guess.
+    return {
+        "intent": intent,
+        "coordinates": coords,
+        "location_query": location_query,
+        "is_followup": followup,
+    }
+
+
+# ---------------------------------------------------------------- location
+def _clarification(state: AgentState) -> str:
+    """Ask for a location instead of inventing one."""
+    missing = state.get("unresolved_location")
+    if missing and state.get("too_broad"):
+        return (
+            f"“{missing}” covers a very large area, so one set of readings cannot describe "
+            "it. "
+            "Which part do you mean? A coastal town or city would work, or coordinates like "
+            "16.0, 86.5."
+        )
+    if missing:
+        return (
+            f"I could not place “{missing}” on the map, and I will not guess a location for it. "
+            "Could you name it a little more precisely — a town or city, or coordinates like "
+            "16.0, 86.5?"
+        )
+    return (
+        "Sure — which location would you like the conditions for? You can name a place "
+        "(for example Chennai, Kochi, Kerala, Odisha or the Bay of Bengal) or give coordinates "
+        "like 16.0, 86.5."
+    )
+
+
+async def resolve_location_node(state: AgentState) -> dict:
+    """Turn the user's words into coordinates — or admit there is no location.
+
+    Priority is strict: coordinates the user typed are used as-is; a place name
+    the user named is geocoded; only a genuine follow-up may reuse the previous
+    turn's location. A name that cannot be resolved is never swapped for
+    another place.
+    """
+    coords = state.get("coordinates")
+    if coords:
+        loc = location.for_coordinates(float(coords["lat"]), float(coords["lon"]))
+        return {"location": loc, "coordinates": {"lat": loc["lat"], "lon": loc["lon"]},
+                "is_followup": False, "needs_location": False}
+
+    query = state.get("location_query")
+    if query:
+        loc = await location.resolve(query)
+        if loc and loc.get("too_broad"):
+            # A country-sized area cannot be answered with one point: ask which
+            # part is meant rather than answering for an arbitrary spot.
+            return {"location": None, "coordinates": None, "unresolved_location": loc["label"],
+                    "too_broad": True, "needs_location": True}
+        if loc:
+            return {"location": loc, "coordinates": {"lat": loc["lat"], "lon": loc["lon"]},
+                    "needs_location": False}
+        return {"location": None, "coordinates": None, "unresolved_location": query,
+                "needs_location": state.get("intent") in LOCATION_INTENTS}
+
+    prior = state.get("prior_location")
+    if prior and state.get("is_followup"):
+        loc = location.from_prior(prior)
+        if loc:
+            return {"location": loc, "coordinates": {"lat": loc["lat"], "lon": loc["lon"]},
+                    "is_followup": True, "needs_location": False}
+
+    if state.get("intent") in LOCATION_INTENTS:
+        return {"needs_location": True}
+    return {}
+
+
+async def conversation_node(state: AgentState) -> dict:
+    """Ordinary conversation: no feeds are touched, nothing is fetched.
+
+    It exists as a node so the fan-out edge always has somewhere to send the
+    state, and it marks the run as conversational for verify/synthesize.
+    """
+    return {"conversation": True}
+
+
+# ---------------------------------------------------------------- fan-out
+def _tasks_for(state: AgentState) -> list[str]:
+    """Which workers this question actually needs (and can run)."""
+    intent = state.get("intent")
+    if intent == "conversation" or state.get("conversation"):
+        return []
+    tasks = list(TASK_MAP.get(intent, ["advisory"]))
+    if state.get("needs_location") or not state.get("coordinates"):
+        # Without a point, only coast-wide sources make sense: the PFZ bulletin
+        # and the advisory knowledge base. Weather/hazard/community are skipped
+        # rather than run against a default location.
+        tasks = [t for t in tasks if t not in _POINT_WORKERS]
+    return tasks
 
 
 def route_workers(state: AgentState) -> list[Send]:
     """Conditional edge: fan out to the workers required by this intent."""
-    tasks = TASK_MAP.get(state.get("intent"), ["advisory"])
+    tasks = _tasks_for(state)
     payload = {
         "message": state["message"],
-        "intent": state["intent"],
+        "intent": state.get("intent"),
         "coordinates": state.get("coordinates"),
+        "location": state.get("location"),
     }
+    if not tasks:
+        return [Send("conversation_node", payload)]
     node_map = {
         "weather": "weather_node",
         "weather_lenient": "weather_node_lenient",
@@ -132,6 +336,10 @@ def route_workers(state: AgentState) -> list[Send]:
 # ---------------------------------------------------------------- workers
 async def weather_node(state: AgentState) -> dict:
     c = state.get("coordinates") or {}
+    if not c:
+        raise weather.WeatherUnavailable(
+            "No location was resolved, so there are no conditions to fetch for this question."
+        )
     data = await weather.get_marine_conditions(c.get("lat"), c.get("lon"))
     return {"weather_data": data}
 
@@ -211,8 +419,11 @@ async def verify_node(state: AgentState) -> dict:
 
     Human tips are cross-referenced with the physical sensor readings gathered
     by the parallel workers; only sensor-corroborated reports are allowed to
-    lift the final confidence score.
+    lift the final confidence score. Ordinary conversation gathers no evidence,
+    so it carries no confidence badge at all.
     """
+    if state.get("conversation"):
+        return {"confidence": None}
     cd = state.get("community_data") or {}
     reports = community.verify_reports(cd.get("reports") or [], state.get("weather_data"))
     verified = [r for r in reports if r.get("verified")]
@@ -223,14 +434,52 @@ async def verify_node(state: AgentState) -> dict:
     }
 
 # ---------------------------------------------------------------- synthesizer
-SYNTH_SYS = (
-    "You are a marine safety officer writing for fishermen and coastal authorities. "
-    "Answer in markdown. Cite sources by name (Open-Meteo, INCOIS, PostGIS hazard DB, "
-    "advisory knowledge base). If a hazard zone hit is reported you MUST lead with a "
-    "prominent ⚠️ warning and a strict DO-NOT recommendation. Never invent numbers — "
-    "use only the data provided. Keep it under ~180 words. Always end with a short "
-    "'🛰️ Map' line describing what was drawn (red = hazard, green = PFZ, cyan/amber = "
-    "community report pins)."
+CONVERSATION_SYS = (
+    "You are THE SEAMONK, a calm, warm marine-intelligence assistant. This message is ordinary "
+    "conversation or a general knowledge question — it is NOT a request for sea conditions, and "
+    "no marine data was fetched for it. Reply naturally in 1–3 short sentences, in plain English, "
+    "in markdown. Be personable and brief: greet back, answer the question, thank them, that kind "
+    "of thing. Never invent weather, sea state, hazards or statistics, and never volunteer marine "
+    "conditions the user did not ask about. If the user asks what you can do or who you are, say "
+    "you are the Seamonk, the assistant of THE SEAMONK maritime intelligence platform, and that "
+    "you can help with live marine weather and sea state for any place or coordinate, fishing "
+    "zones (PFZ), hazard-zone checks for a position, voyage-safety advisories, fisher community "
+    "reports, and the map/analytics console. Do not add a map line or a confidence note."
+)
+
+MARINE_SYS = (
+    "You are THE SEAMONK, a marine-safety assistant talking with fishers, boat operators and "
+    "coastal users. The evidence below was fetched for this question. Write the answer in "
+    "markdown, in plain everyday English.\n"
+    "Rules:\n"
+    "- Answer the question that was actually asked, and keep the answer proportional: a one-line "
+    "question gets one or two sentences; 'explain the conditions' or 'detailed conditions' can be "
+    "a short paragraph with a few bullets.\n"
+    "- Interpret the readings, do not list them. Say what the numbers MEAN for someone on the "
+    "water — how rough, how windy, how comfortable, how demanding — instead of restating raw "
+    "fields. Combine related readings (wind together with gusts, wave height together with wave "
+    "period, air temperature with the sky).\n"
+    "- Never dump a block of measurements, and never explain a number with itself.\n"
+    "- Follow the question's focus: waves question -> wave and swell conditions; wind question -> "
+    "wind and gusts; safety/boat question -> what the sea state means for a small boat; a bare "
+    "'weather' question -> the overall picture; a 'what does that mean' question -> explain the "
+    "conditions already discussed.\n"
+    "- Always make clear which place the readings are for, using the resolved location name. If "
+    "the scope says the location is a region or a sea, say plainly that the readings are for the "
+    "representative point given and not for the whole area.\n"
+    "- This may be a follow-up: keep the location and the topic from the conversation so far "
+    "unless the user changed them; if the user names a new place, the answer is for that new "
+    "place.\n"
+    "- Stay honest and cautious. Never call conditions completely safe; give a safety verdict only "
+    "from the sea-state evidence given. Do not invent causes (a cyclone, a front, a warning) that "
+    "the data does not show. If a dataset is missing for this location, say so instead of "
+    "inventing it, and treat each dataset independently.\n"
+    "- If the evidence contains a hazard-zone hit, lead with a prominent ⚠️ warning and a strict "
+    "do-not-venture recommendation.\n"
+    "- Under about 170 words. Cite sources briefly (Open-Meteo, INCOIS, PostGIS hazard database, "
+    "advisory knowledge base) where you use them.\n"
+    "- End with a single short '🛰️ Map' line ONLY if the map actually shows something (hazard "
+    "polygons, PFZ zones or community pins)."
 )
 
 
@@ -248,32 +497,153 @@ def _merge_features(state: AgentState) -> dict:
     return {"type": "FeatureCollection", "features": features}
 
 
+def _num(value, digits: int = 3) -> str:
+    return f"{value:.{digits}f}" if isinstance(value, (int, float)) else "?"
+
+
+def _location_lines(state: AgentState) -> list[str]:
+    """How the answer should describe where its readings come from."""
+    loc = state.get("location")
+    if not loc:
+        return ["Location: none resolved for this question."]
+    parts = [f"Location: {loc.get('display_name') or loc.get('label')} "
+             f"(lat={loc.get('lat')}, lon={loc.get('lon')})",
+             f"Location scope: {loc.get('scope')}",
+             f"Coordinates were obtained from: {loc.get('source')}"]
+    if loc.get("representative"):
+        parts.append(
+            "IMPORTANT: the coordinates above are a representative point for that larger area "
+            "(a water point inside it), NOT the area's centre — say so in the answer."
+        )
+    if loc.get("scope") == "sea":
+        parts.append(
+            "IMPORTANT: a sea/bay is a large area; these readings describe the queried point in "
+            "it, not the entire water body — do not claim they cover all of it."
+        )
+    if loc.get("scope") == "region":
+        parts.append(
+            "IMPORTANT: a region is far larger than one point; say the readings are for the "
+            "representative water point above and do not imply they cover the whole region."
+        )
+    return parts
+
+
+def _history_lines(state: AgentState) -> list[str]:
+    turns = state.get("history") or []
+    if not turns:
+        return []
+    return ["Conversation so far (oldest first):"] + [
+        f"{t['role']}: {t['content']}" for t in turns
+    ]
+
+
 def _context(state: AgentState) -> str:
-    parts = [f"User query: {state['message']}",
-             f"Intent: {state.get('intent')}",
-             f"Coordinates: {state.get('coordinates')}"]
+    """Everything the writer is allowed to use, labelled, with availability."""
+    parts = [
+        f"User's question: {state['message']}",
+        f"Intent: {state.get('intent')}",
+        f"Is this a follow-up to the previous turn: {'yes' if state.get('is_followup') else 'no'}",
+        *_location_lines(state),
+        *_history_lines(state),
+    ]
+
     w = state.get("weather_data")
     if w:
-        parts.append("WEATHER: " + ", ".join(f"{k}={v}" for k, v in w.items()))
+        parts.append(
+            "WEATHER (Open-Meteo, live): " + ", ".join(
+                f"{k}={v}" for k, v in w.items() if k != "forecast_days"
+            )
+        )
+        days = w.get("forecast_days") or []
+        if days:
+            parts.append("DAY BY DAY (today and the next two days):")
+            for d in days:
+                fields = ", ".join(f"{k}={v}" for k, v in d.items() if v is not None)
+                parts.append(f"  - {fields}")
+    else:
+        parts.append("WEATHER: no live weather/sea-state reading is available for this question.")
+
     g = state.get("geospatial_data") or {}
-    zones = g.get("zones") or []
-    parts.append("HAZARD CHECK: " + (f"HIT -> {zones}" if zones else "No active hazard zone at this location."))
+    if g.get("checked"):
+        zones = g.get("zones") or []
+        if zones:
+            parts.append("HAZARD CHECK (PostGIS): HIT -> " + str(zones))
+        else:
+            parts.append(
+                "HAZARD CHECK (PostGIS): no recorded hazard zone contains this exact point. "
+                "This only means nothing is recorded here — it does not prove the area is "
+                "hazard-free."
+            )
+    else:
+        parts.append("HAZARD CHECK: not performed for this question (no location checked).")
+
     p = state.get("pfz_data")
     if p:
-        names = [f["properties"]["location_name"] for f in p.get("geojson", {}).get("features", [])]
-        parts.append(f"PFZ ZONES ({p.get('zone_count', 0)}): {names}")
+        feats = (p.get("geojson") or {}).get("features") or []
+        names = [f["properties"].get("location_name") for f in feats]
+        parts.append(f"PFZ (INCOIS bulletin, {p.get('zone_count', len(feats))} active zones): {names}")
+    else:
+        parts.append("PFZ: no PFZ bulletin data was retrieved for this question.")
+
     a = state.get("advisory_data") or {}
+    advisory_lines = []
     for m in (a.get("matches") or [])[:2]:
-        parts.append(f"ADVISORY [{m.get('category')}] {m.get('title')}: {(m.get('content') or '')[:400]}")
+        if m.get("title"):
+            advisory_lines.append(
+                f"ADVISORY [{m.get('category')}] {m.get('title')}: {(m.get('content') or '')[:400]}"
+            )
+    parts.append("\n".join(advisory_lines) if advisory_lines
+                 else "ADVISORY: nothing relevant found in the advisory knowledge base.")
+
     cd = state.get("community_data") or {}
-    for r in (cd.get("reports") or [])[:4]:
-        trust = "VERIFIED" if r.get("verified") else "UNVERIFIED"
+    if cd.get("searched"):
+        reports = cd.get("reports") or []
+        if reports:
+            parts.append(f"COMMUNITY REPORTS near the point ({len(reports)} found):")
+            for r in reports[:4]:
+                trust = "VERIFIED against live sensors" if r.get("verified") else "UNVERIFIED"
+                parts.append(
+                    f"  - {trust} [{r.get('category')}] at {_num(r.get('lat'))},{_num(r.get('lon'))} "
+                    f"on {r.get('observed_at')}: {r.get('description')} — {r.get('verification_note')}"
+                )
+        else:
+            parts.append("COMMUNITY REPORTS: none reported near this point in the last 72 hours.")
+    else:
+        parts.append("COMMUNITY REPORTS: not searched (no location for this question).")
+
+    errors = state.get("feed_errors") or []
+    if errors:
+        parts.append("FEED FAILURES: " + "; ".join(errors))
+
+    conf = state.get("confidence")
+    if conf:
         parts.append(
-            f"COMMUNITY [{trust}] {r.get('category')} by {r.get('reporter_role') or 'community'} "
-            f"at {r.get('lat'):.3f},{r.get('lon'):.3f} on {r.get('observed_at')}: "
-            f"{r.get('description')} — {r.get('verification_note')}"
+            f"CONFIDENCE (assigned by the platform, shown beside the answer): "
+            f"{conf.get('score')}% {conf.get('label')} — factors: {', '.join(conf.get('factors') or [])}"
         )
     return "\n".join(parts)
+
+
+def _conversation_context(state: AgentState) -> str:
+    lines = [f"User's message: {state['message']}"]
+    turns = _history_lines(state)
+    if turns:
+        lines += ["", *turns]
+    lines += [
+        "",
+        "This is ordinary conversation — no marine data was fetched, and none may be invented.",
+        "The platform's capabilities (mention only what fits the question): live marine weather "
+        "and sea state for any place or coordinates; PFZ fishing-zone advisories; hazard-zone "
+        "checks for a position; voyage-safety advisories; verified fisher community reports; and "
+        "a map/analytics console with confidence-scored answers in twelve Indian languages.",
+    ]
+    return "\n".join(lines)
+
+
+def _prompt_for(state: AgentState) -> tuple[str, str]:
+    if state.get("conversation"):
+        return CONVERSATION_SYS, _conversation_context(state)
+    return MARINE_SYS, _context(state)
 
 
 def _compass(deg: float | None) -> str:
@@ -295,126 +665,240 @@ def _sea_verdict(wave_m: float | None, gusts_kmh: float | None) -> str:
     return "**Poor** — advise staying in harbour until the sea settles."
 
 
-def _fmt_conditions(w: dict) -> list[str]:
-    kt = lambda v: round(v / 1.852) if isinstance(v, (int, float)) else None
-    wind, gusts = kt(w.get("wind_speed_kmh")), kt(w.get("wind_gusts_kmh"))
-    lines = []
-    if wind is not None:
-        g = f", gusting {gusts} kt" if gusts else ""
-        lines.append(f"- Wind: **{wind} kt**{g}")
-    wave = w.get("wave_height_m")
-    if wave is not None:
-        per = w.get("wave_period_s")
-        d = _compass(w.get("wave_direction_deg"))
-        lines.append(f"- Waves: **{wave} m**" + (f" at {per} s" if per else "") + (f" from {d}" if d else ""))
-    sst = w.get("sea_surface_temperature_c")
-    if sst is not None:
-        lines.append(f"- Sea surface: **{sst} °C**" + (f" · air {w['air_temperature_c']} °C" if w.get("air_temperature_c") is not None else ""))
-    if w.get("weather"):
-        lines.append(f"- Sky: {w['weather']}")
-    return lines
+def _wind_phrase(kmh: float, gusts: float | None) -> str:
+    """Plain reading of a wind speed — what it feels like, not the number again."""
+    if kmh < 12:
+        feel = "light"
+    elif kmh < 20:
+        feel = "a moderate breeze"
+    elif kmh < 30:
+        feel = "fairly fresh"
+    elif kmh < 40:
+        feel = "strong"
+    else:
+        feel = "very strong"
+    text = f"Winds are {feel}, around {round(kmh)} km/h"
+    if isinstance(gusts, (int, float)):
+        text += f", gusting to {round(gusts)} km/h"
+        if gusts >= kmh * 1.35 and gusts >= 30:
+            text += " — the gusts will make it feel rougher in spells"
+    return text + "."
+
+
+def _wave_phrase(height: float, period: float | None, direction_deg: float | None) -> str:
+    if height < 0.5:
+        feel = "very calm"
+    elif height < 1.0:
+        feel = "slight"
+    elif height < 1.5:
+        feel = "moderate but manageable"
+    elif height < 2.5:
+        feel = "moderately rough"
+    elif height < 3.5:
+        feel = "rough"
+    else:
+        feel = "very rough"
+    text = f"Waves are about {height} m — {feel} seas"
+    if isinstance(period, (int, float)):
+        text += f", arriving roughly every {round(period)} seconds"
+    text += "."
+    if height >= 1.5:
+        text += " Small boats should treat that as uncomfortable work."
+    elif height < 1.0:
+        text += " That is easy water for most craft."
+    if direction_deg is not None:
+        text += f" They are running from the {_compass(direction_deg)}."
+    return text
+
+
+def _focus(message: str) -> str:
+    """What the user asked about, so the writer can stay proportional."""
+    msg = message.lower()
+    if any(w in msg for w in ("wave", "swell", "sea state", "rough")):
+        return "waves"
+    if any(w in msg for w in ("wind", "gust", "breez")):
+        return "wind"
+    if any(w in msg for w in ("safe", "boat", "sail", "hazard", "danger", "venture")):
+        return "safety"
+    if any(w in msg for w in ("tomorrow", "forecast", "next day", "day after")):
+        return "forecast"
+    return "conditions"
+
+
+def _day_phrase(day: dict | None) -> str | None:
+    if not day:
+        return None
+    bits = [f"{day.get('date')}"]
+    if day.get("wave_max_m") is not None:
+        bits.append(f"waves up to {day['wave_max_m']} m")
+    if day.get("wind_max_kmh") is not None:
+        bits.append(f"winds to {day['wind_max_kmh']} km/h")
+    if day.get("gust_max_kmh") is not None:
+        bits.append(f"gusts to {day['gust_max_kmh']} km/h")
+    if day.get("weather"):
+        bits.append(str(day["weather"]).lower())
+    if day.get("rain_chance_pct"):
+        bits.append(f"{day['rain_chance_pct']}% chance of rain")
+    return ", ".join(bits)
 
 
 def _fallback_answer(state: AgentState, partial: str = "") -> str:
-    """Compose the answer straight from the live feeds the workers gathered.
+    """Compose the answer from the live feeds when the AI writer is unreachable.
 
-    Used when the LLM provider is unreachable (quota exhausted, outage). Every
-    number here comes from an observed/model feed — nothing is invented — and
-    the answer says so, in one quiet line, without losing its authority.
+    Used when the LLM provider is unreachable (quota exhausted, outage). The
+    wording is conversational — it explains what the readings mean instead of
+    listing them — and every number still comes from an observed/model feed.
     """
-    c = state.get("coordinates") or {}
-    where = f"{c['lat']:.2f}°N, {c['lon']:.2f}°E" if c else "your area"
-    sections: list[str] = [f"**Feed brief for {where}**"]
+    if state.get("needs_location"):
+        return _clarification(state)
 
+    loc = state.get("location") or {}
+    c = state.get("coordinates") or {}
+    where = loc.get("label") or (
+        f"{c['lat']:.2f}°N, {c['lon']:.2f}°E" if c else "your area"
+    )
+    sections: list[str] = [f"**{where}**"]
+    scope_note: list[str] = []
+
+    if loc and loc.get("scope") in ("region", "sea") and c:
+        kind = "water body" if loc.get("scope") == "sea" else "region"
+        scope_note.append(
+            f"{where} is a {kind}, so these readings are for a representative point at "
+            f"{c['lat']:.2f}°N, {c['lon']:.2f}°E"
+            + ("." if loc.get("scope") == "sea" else " inside it, not for the whole area.")
+        )
+    elif loc.get("representative") and c:
+        scope_note.append(
+            f"These readings come from the nearest water point to {where}, at "
+            f"{c['lat']:.2f}°N, {c['lon']:.2f}°E."
+        )
+
+    focus = _focus(state["message"])
     w = state.get("weather_data")
+    sentences: list[str] = []
     if w:
-        cond = _fmt_conditions(w)
-        if cond:
-            sections += ["### Observed conditions — Open-Meteo", *cond,
-                         "", "→ " + _sea_verdict(w.get("wave_height_m"), w.get("wind_gusts_kmh"))]
+        wave = w.get("wave_height_m")
+        if wave is not None and focus in ("waves", "conditions", "safety"):
+            sentences.append(_wave_phrase(
+                wave, w.get("wave_period_s"), w.get("wave_direction_deg")
+            ))
+        speed = w.get("wind_speed_kmh")
+        if speed is not None and focus in ("wind", "conditions", "safety"):
+            sentences.append(_wind_phrase(speed, w.get("wind_gusts_kmh")))
+        if wave is not None and focus == "wind":
+            sentences.append(_wave_phrase(wave, w.get("wave_period_s"), w.get("wave_direction_deg")))
+        if speed is not None and focus == "waves":
+            sentences.append(_wind_phrase(speed, w.get("wind_gusts_kmh")))
+        sky = []
+        if w.get("air_temperature_c") is not None:
+            sky.append(f"the air is around {w['air_temperature_c']} °C")
+        if w.get("sea_surface_temperature_c") is not None:
+            sky.append(f"the sea surface is {w['sea_surface_temperature_c']} °C")
+        if w.get("weather"):
+            sky.append(f"the sky is {str(w['weather']).lower()}")
+        if sky:
+            first = sky[0][0].upper() + sky[0][1:]
+            rest = ""
+            if len(sky) > 1:
+                rest = ", " + " and ".join(sky[1:])
+            sentences.append(f"{first}{rest}.")
+    sections.append(" ".join(sentences) if sentences else
+                    "I could not reach the live weather and sea-state feeds, so I have no "
+                    "observed conditions to report for this location right now.")
+
+    if w:
+        sections.append("Sea state: " + _sea_verdict(w.get("wave_height_m"), w.get("wind_gusts_kmh")))
+
+    days = (w or {}).get("forecast_days") or []
+    if focus == "forecast" and days:
+        parts = [p for p in (_day_phrase(d) for d in days[:2]) if p]
+        if parts:
+            sections.append("Day by day — " + "; ".join(parts) + ".")
+
+    if scope_note:
+        sections.append(" ".join(scope_note))
 
     g = state.get("geospatial_data") or {}
     if g.get("checked"):
         zones = g.get("zones") or []
         if zones:
             z = zones[0]
-            sections += ["", "### ⚠️ Hazard geofence — PostGIS",
-                         f"This point is **inside recorded hazard zone “{z.get('name')}” (severity {z.get('severity')}). DO NOT venture here.** {z.get('advisory') or ''}".strip()]
+            sections.append(
+                f"⚠️ **Do not venture here.** This position falls inside the recorded hazard zone "
+                f"“{z.get('name')}” (severity {z.get('severity')}). {z.get('advisory') or ''}".strip()
+            )
         else:
-            sections += ["", "### Hazard geofence — PostGIS",
-                         "✅ No recorded hazard zone at this location."]
+            sections.append(
+                "No recorded hazard zone contains the queried position — that means nothing is "
+                "recorded here, not that the area is hazard-free."
+            )
 
-    p = state.get("pfz_data")
-    if p:
-        feats = (p.get("geojson") or {}).get("features") or []
+    p = state.get("pfz_data") or {}
+    feats = (p.get("geojson") or {}).get("features") or []
+    if feats and (state.get("intent") == "pfz_search" or focus in ("conditions", "safety")):
         rows = []
-        for f in feats[:4]:
+        for f in feats[:3]:
             pr = f.get("properties") or {}
             name = pr.get("location_name") or pr.get("name") or "zone"
             prob = pr.get("probability")
             rows.append(f"{name}" + (f" ({prob}% likelihood)" if isinstance(prob, (int, float)) else ""))
-        if rows:
-            sections += ["", f"### Fishing zones — INCOIS bulletin ({p.get('zone_count', len(feats))} active)",
-                         "· " + "\n· ".join(rows)]
+        sections.append(
+            f"Fishing zones from the INCOIS bulletin ({p.get('zone_count', len(feats))} active): "
+            + "; ".join(rows) + "."
+        )
 
-    a = state.get("advisory_data") or {}
-    for m in (a.get("matches") or [])[:2]:
+    for m in ((state.get("advisory_data") or {}).get("matches") or [])[:1]:
         if m.get("title"):
-            content = (m.get("content") or "").strip()[:220]
-            sections += ["", f"### Advisory — {m.get('category') or 'general'}",
-                         f"**{m['title']}**" + (f": {content}…”" if len(m.get("content") or "") > 220 else (f": {content}" if content else ""))]
+            content = (m.get("content") or "").strip()
+            sections.append(
+                f"Advisory — **{m['title']}**"
+                + (f": {content[:200]}{'…' if len(content) > 200 else ''}" if content else "")
+            )
 
-    cd = state.get("community_data") or {}
-    reports = [r for r in (cd.get("reports") or [])]
+    reports = ((state.get("community_data") or {}).get("reports") or [])
     if reports:
         trusted = [r for r in reports if r.get("verified")]
         r0 = (trusted or reports)[0]
-        tag = "sensor-verified" if r0.get("verified") else "unverified"
-        sections += ["", f"### Community reports ({len(reports)} near, {len(trusted)} verified)",
-                     f"“{(r0.get('description') or '')[:160]}” — {tag}, {r0.get('observed_at') or 'recent'}"]
+        sections.append(
+            f"Community: {'a sensor-verified' if r0.get('verified') else 'an unverified'} report "
+            f"nearby — “{(r0.get('description') or '')[:150]}” ({r0.get('observed_at') or 'recent'})."
+        )
 
-    if len(sections) <= 1:
-        # Nothing usable came back — say so plainly instead of shipping a shell.
-        sections = [
-            f"**Feed brief for {where}**",
-            "",
-            (
-                "I could not reach the live feeds just now, so I have nothing "
-                "observed to report. Please try again in a few minutes."
-                if state.get("feed_errors")
-                else
-                "Every feed answered, but there is nothing active to report "
-                "right now — no zones in the bulletin, no matching advisories "
-                "and no community reports for this question."
-            ),
-        ]
-        return "\n".join(sections)
+    errors = state.get("feed_errors") or []
+    if errors:
+        sections.append(
+            f"{len(errors)} live feed(s) could not be reached just now, so this answer covers "
+            "only what responded."
+        )
 
     drawn = []
     if (g.get("geojson") or {}).get("features"):
         drawn.append("hazard zones in red")
-    if (p or {}).get("geojson", {}).get("features"):
+    if (p.get("geojson") or {}).get("features"):
         drawn.append("PFZ polygons in green")
     if reports:
         drawn.append("community pins in cyan")
-    sections += ["", "🛰️ Map: " + (" and ".join(drawn) + " drawn on the chart." if drawn else "nothing to draw for this question.")]
+    if drawn:
+        sections.append("🛰️ Map: " + " and ".join(drawn) + " drawn on the chart.")
 
-    feed_errors = state.get("feed_errors") or []
-    if feed_errors:
-        sections += ["", "⚠️ " + f"{len(feed_errors)} live feed(s) could not be reached just now, so this brief covers only what answered."]
-
+    sections.append(
+        "_Assembled directly from the platform's live feeds — the AI writer is unavailable, so "
+        "no number here is paraphrased._"
+    )
     if partial:
         sections = [partial, "", "---", *sections]
-    sections += ["", "_Assembled directly from the platform's live feeds — the AI writer is temporarily unavailable, so no number here is paraphrased._"]
-    return "\n".join(sections)
+    return "\n\n".join(s for s in sections if s)
 
 
 async def synthesize_node(state: AgentState) -> dict:
-    """gpt-4o markdown answer; falls back to a live-feed brief when the
+    """gpt-4o natural-language answer; falls back to a live-feed brief when the
     provider is down (quota/outage) so the Monk still answers from real data."""
+    if state.get("needs_location"):
+        return {"response": _clarification(state), "map_features": None}
     map_features = _merge_features(state)
+    system, user = _prompt_for(state)
     try:
-        response = await chat_markdown(SYNTH_SYS, _context(state))
+        response = await chat_markdown(system, user)
     except LLMError:
         response = _fallback_answer(state)
     # Trimmed payload: the big geojson blobs are already merged into
@@ -430,10 +914,17 @@ async def synthesize_stream_node(state: AgentState):
     is completed from the live-feed brief instead of leaving the user with
     a dead stream.
     """
+    if state.get("needs_location"):
+        response = _clarification(state)
+        yield ("__token__", response)
+        yield "result", {"response": response, "map_features": None}
+        return
+
     map_features = _merge_features(state)
+    system, user = _prompt_for(state)
     response = ""
     try:
-        async for token in chat_markdown_stream(SYNTH_SYS, _context(state)):
+        async for token in chat_markdown_stream(system, user):
             response += token
             yield ("__token__", token)
     except LLMError:
@@ -441,11 +932,10 @@ async def synthesize_stream_node(state: AgentState):
         # the feeds already gathered — never a fabricated report, only real
         # observed/model values, and the brief says where it came from.
         brief = _fallback_answer(state)
-        tail = brief.split("\n\n---\n", 1)[-1]
         if response:
-            separator = "\n\n---\n"
-            yield ("__token__", separator + tail)
-            response = response + separator + tail
+            separator = "\n\n---\n\n"
+            yield ("__token__", separator + brief)
+            response = response + separator + brief
         else:
             yield ("__token__", brief)
             response = brief
@@ -468,21 +958,78 @@ def _status(stage: str, **extra) -> tuple[str, dict]:
     return "status", {"stage": stage, "label": STATUS_LABELS.get(stage, stage), **extra}
 
 
-async def run_chat_stream(message: str) -> AsyncIterator[tuple[str, dict | str]]:
+def _prior_from_context(context: dict | None) -> dict | None:
+    """Normalise the caller's carried-over location into a `prior_location`."""
+    if not context:
+        return None
+    lat, lon = context.get("lat"), context.get("lon")
+    if lat is None or lon is None:
+        return None
+    try:
+        return {
+            "location": context.get("location"),
+            "lat": float(lat),
+            "lon": float(lon),
+            "scope": context.get("scope"),
+            "representative": bool(context.get("representative")),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def _final_payload(state: AgentState) -> dict:
+    cd = state.get("community_data") or {}
+    loc = state.get("location") or None
+    return {
+        "response": state.get("response", ""),
+        "map_features": state.get("map_features")
+        or {"type": "FeatureCollection", "features": []},
+        "intent": state.get("intent") or "general_advisory",
+        "coordinates": state.get("coordinates"),
+        # the resolved place travels back so the next turn can be a follow-up
+        "location": loc,
+        "needs_location": bool(state.get("needs_location")),
+        "confidence": state.get("confidence"),
+        "community": {
+            "count": len(cd.get("reports") or []),
+            "verified_count": cd.get("verified_count", 0),
+        },
+    }
+
+
+async def run_chat_stream(
+    message: str,
+    history: list[dict] | None = None,
+    context: dict | None = None,
+) -> AsyncIterator[tuple[str, dict | str]]:
     """SSE-friendly orchestration mirroring the LangGraph DAG (same nodes).
 
     Yields ("status", {...}) milestones with human-readable labels,
     ("token", str) synthesis tokens as they are generated, and finally
     ("final", {...}) with the complete trimmed result — including the
     out-of-band `confidence` payload that must never enter the token stream.
+
+    `history` (recent turns) and `context` (the location resolved last time) are
+    optional and keep follow-up questions grounded; omitting them keeps the
+    original single-message behaviour, so existing clients are unaffected.
     """
-    state: AgentState = {"message": message}
+    state: AgentState = {"message": message, "history": _last_turns(history)}
+    prior = _prior_from_context(context)
+    if prior:
+        state["prior_location"] = prior
 
     state.update(await router_node(state))
     yield _status("routed", intent=state.get("intent"))
 
-    tasks = TASK_MAP.get(state.get("intent"), ["advisory"])
-    payload = {k: state.get(k) for k in ("message", "intent", "coordinates")}
+    if state.get("intent") == "conversation":
+        # Ordinary conversation: not one feed is touched.
+        state.update(await conversation_node(state))
+    else:
+        yield _status("locating")
+        state.update(await resolve_location_node(state))
+
+    tasks = _tasks_for(state)
+    payload = {k: state.get(k) for k in ("message", "intent", "coordinates", "location")}
 
     async def _run(name: str):
         return name, await _STREAM_NODE_MAP[name](payload)
@@ -500,35 +1047,40 @@ async def run_chat_stream(message: str) -> AsyncIterator[tuple[str, dict | str]]
         yield _status(name)
     state["feed_errors"] = feed_errors
 
-    # Verification matrix + confidence scoring (out-of-band of the tokens).
-    yield _status("verifying")
-    state.update(await verify_node(state))
+    if state.get("needs_location"):
+        # A marine question with no resolvable location. Answer by asking for
+        # one — never by fetching conditions for some other place.
+        yield _status("chatting")
+        async for kind, chunk in synthesize_stream_node(state):
+            if kind == "__token__":
+                yield "token", chunk
+            else:
+                state.update(chunk)
+        yield "final", _final_payload(state)
+        return
 
-    yield _status("synthesizing")
+    if not state.get("conversation"):
+        # Verification matrix + confidence scoring (out-of-band of the tokens).
+        yield _status("verifying")
+        state.update(await verify_node(state))
+        yield _status("synthesizing")
+    else:
+        yield _status("chatting")
+
     async for kind, chunk in synthesize_stream_node(state):
         if kind == "__token__":
             yield "token", chunk
         else:
             state.update(chunk)
 
-    cd = state.get("community_data") or {}
-    yield "final", {
-        "response": state.get("response", ""),
-        "map_features": state.get("map_features")
-        or {"type": "FeatureCollection", "features": []},
-        "intent": state.get("intent") or "general_advisory",
-        "coordinates": state.get("coordinates"),
-        "confidence": state.get("confidence"),
-        "community": {
-            "count": len(cd.get("reports") or []),
-            "verified_count": cd.get("verified_count", 0),
-        },
-    }
+    yield "final", _final_payload(state)
 
 # ---------------------------------------------------------------- graph
 def build_graph():
     g = StateGraph(AgentState)
     g.add_node("router", router_node)
+    g.add_node("resolve_location", resolve_location_node)
+    g.add_node("conversation_node", conversation_node)
     g.add_node("weather_node", weather_node)
     g.add_node("geospatial_node", geospatial_node)
     g.add_node("pfz_node", pfz_node)
@@ -538,12 +1090,16 @@ def build_graph():
     g.add_node("synthesize", synthesize_node)
 
     g.add_edge(START, "router")
-    # router -> parallel workers (Send fan-out); workers rejoin at verify
+    # router -> location resolution -> parallel workers (Send fan-out) -> verify
+    g.add_edge("router", "resolve_location")
     g.add_conditional_edges(
-        "router", route_workers,
-        ["weather_node", "geospatial_node", "pfz_node", "advisory_node", "community_node"],
+        "resolve_location",
+        route_workers,
+        ["conversation_node", "weather_node", "geospatial_node", "pfz_node",
+         "advisory_node", "community_node"],
     )
-    for w in ("weather_node", "geospatial_node", "pfz_node", "advisory_node", "community_node"):
+    for w in ("conversation_node", "weather_node", "geospatial_node", "pfz_node",
+              "advisory_node", "community_node"):
         g.add_edge(w, "verify")
     g.add_edge("verify", "synthesize")
     g.add_edge("synthesize", END)
