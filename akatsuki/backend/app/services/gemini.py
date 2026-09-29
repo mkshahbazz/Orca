@@ -5,21 +5,31 @@ v1beta) with `httpx`, which is already a dependency of this project. Nothing
 here knows about agents, weather or confidence: it is a pure text-in / text-out
 provider so `app/llm.py` can treat OpenAI and Gemini identically.
 
-Why REST rather than the `google-genai` package: the pinned SDK drifts faster
-than this deployment can track (model ids are retired for new callers and
-recommended replacements change between releases), while the wire format below
-is stable. Everything is confined to this file, so swapping in the SDK later
+Why REST rather than the `google-genai` package: model ids are retired for new
+callers on a schedule this deployment cannot track (we watched `2.5-flash`
+start returning 404 mid-session), and the wire format below is stable across
+that churn. Everything is confined to this file, so swapping in the SDK later
 means editing `_call`/`_stream` and nothing else.
+
+Model chain, and why it is a chain:
+
+  The free tier meters *per model* (5 requests/minute on `3.5-flash`), so a
+  single model id cannot carry a chat that needs a router call and a synthesis
+  call. Walking several available models multiplies the usable capacity, and a
+  model that is temporarily overloaded (503) or retired (404) costs one attempt
+  instead of the whole request. After the chain is exhausted, one bounded second
+  pass gives a burst limit time to clear before the provider is called broken.
 
 Honesty rules this module keeps:
   * a missing key is reported, never masked;
   * every failure is logged at ERROR with the HTTP status and response body;
-  * a model that is temporarily unavailable is retried down the configured
-    chain before the provider is declared broken.
+  * a stream that breaks after tokens have been sent raises rather than
+    silently restarting, so the user never sees the answer begin twice.
 """
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -31,10 +41,17 @@ log = logging.getLogger("marine.gemini")
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 TIMEOUT_S = 60.0
+# Two passes over the model chain: the first tries every model, the second gives
+# a per-minute burst limit a moment to clear. Longer waits are not worth it — the
+# user would rather be told the provider is rate limited than wait in silence.
+PASSES = 2
+PASS_PAUSE_S = 2.5
 
 # Statuses that mean "try the next model / try again", not "your request or key
 # is wrong". 404 appears when a model id is retired for new callers.
 RETRYABLE_STATUS = (404, 429, 500, 502, 503, 504)
+
+_RETRY_DELAY = re.compile(r"retry(?:Delay|in)?[\"':\s]*([0-9.]+)s", re.IGNORECASE)
 
 
 class GeminiError(RuntimeError):
@@ -78,6 +95,10 @@ async def shutdown() -> None:
         _client = None
 
 
+def _chain() -> list[str]:
+    return settings.gemini_models()
+
+
 def _payload(
     system: str,
     user: str,
@@ -106,6 +127,20 @@ def _describe(resp: httpx.Response) -> str:
     except Exception:  # pragma: no cover - body already consumed
         detail = "<unreadable body>"
     return f"HTTP {resp.status_code}: {detail}"
+
+
+def _retry_hint(resp: httpx.Response) -> float | None:
+    """The provider's own 'retry in Ns', when it gives one.
+
+    Only used to decide whether a second pass is worth attempting — never to
+    make the user wait out a long quota window.
+    """
+    try:
+        text = resp.text
+    except Exception:
+        return None
+    match = _RETRY_DELAY.search(text)
+    return float(match.group(1)) if match else None
 
 
 def _text_from(response: dict) -> str:
@@ -148,37 +183,45 @@ async def _generate(
     temperature: float,
     max_output_tokens: int | None = None,
 ) -> str:
-    """Generate once, walking the configured model chain on retryable failures."""
+    """Generate once, walking the model chain (twice at most) before giving up."""
     client = await _get_client()
     headers = {"x-goog-api-key": _key()}
     body = _payload(
         system, user, json_mode=json_mode, temperature=temperature,
         max_output_tokens=max_output_tokens,
     )
-    models = settings.gemini_models()
+    models = _chain()
     last_error: str | None = None
+    retryable = False
 
-    for index, model in enumerate(models):
-        try:
-            resp = await client.post(
-                f"/models/{model}:generateContent", json=body, headers=headers
-            )
-        except httpx.HTTPError as exc:  # network / DNS / timeout
-            last_error = f"{model}: {type(exc).__name__}: {exc}"
-            log.error("Gemini request to %s failed: %s", model, last_error)
-            continue
+    for attempt in range(PASSES):
+        if attempt:
+            await asyncio.sleep(PASS_PAUSE_S)
+        for index, model in enumerate(models):
+            try:
+                resp = await client.post(
+                    f"/models/{model}:generateContent", json=body, headers=headers
+                )
+            except httpx.HTTPError as exc:  # network / DNS / timeout
+                last_error = f"{model}: {type(exc).__name__}: {exc}"
+                retryable = True
+                log.error("Gemini request to %s failed: %s", model, last_error)
+                continue
 
-        if resp.status_code == 200:
-            if index:
-                log.warning("Gemini answered on fallback model %s", model)
-            return _text_from(resp.json())
+            if resp.status_code == 200:
+                if index or attempt:
+                    log.warning("Gemini answered on fallback model %s (pass %d)", model, attempt + 1)
+                return _text_from(resp.json())
 
-        last_error = f"{model}: {_describe(resp)}"
-        log.error("Gemini %s rejected the request — %s", model, last_error)
-        if resp.status_code not in RETRYABLE_STATUS:
+            last_error = f"{model}: {_describe(resp)}"
+            retryable = resp.status_code in RETRYABLE_STATUS
+            log.error("Gemini %s rejected the request — %s", model, last_error)
+            if not retryable:
+                break
+            if index + 1 < len(models):
+                await asyncio.sleep(0.3)
+        if not retryable:
             break
-        if index + 1 < len(models):
-            await asyncio.sleep(0.4)
 
     raise GeminiError(f"Gemini request failed. {last_error or 'no model available'}")
 
@@ -203,58 +246,70 @@ async def chat_text(system: str, user: str, temperature: float = 0.3) -> str:
 async def chat_text_stream(system: str, user: str, temperature: float = 0.3) -> AsyncIterator[str]:
     """Streaming variant — yields answer text as it arrives.
 
-    Falls back down the model chain on retryable failures *before the first
+    Falls back through the model chain on retryable failures *before the first
     token*. Once tokens have been emitted the stream is committed: silently
     restarting mid-answer would duplicate text in the user's window.
     """
     client = await _get_client()
     headers = {"x-goog-api-key": _key()}
     body = _payload(system, user, json_mode=False, temperature=temperature)
-    models = settings.gemini_models()
+    models = _chain()
     last_error: str | None = None
+    emitted = False
+    retryable = False
 
-    for index, model in enumerate(models):
-        emitted = False
-        try:
-            async with client.stream(
-                "POST",
-                f"/models/{model}:streamGenerateContent?alt=sse",
-                json=body,
-                headers=headers,
-            ) as resp:
-                if resp.status_code != 200:
-                    await resp.aread()
-                    last_error = f"{model}: {_describe(resp)}"
-                    log.error("Gemini stream %s rejected — %s", model, last_error)
-                    if resp.status_code not in RETRYABLE_STATUS:
-                        raise GeminiError(f"Gemini request failed. {last_error}")
-                    continue
+    for attempt in range(PASSES):
+        if attempt and not emitted:
+            await asyncio.sleep(PASS_PAUSE_S)
+        for index, model in enumerate(models):
+            try:
+                async with client.stream(
+                    "POST",
+                    f"/models/{model}:streamGenerateContent?alt=sse",
+                    json=body,
+                    headers=headers,
+                ) as resp:
+                    if resp.status_code != 200:
+                        await resp.aread()
+                        retryable = resp.status_code in RETRYABLE_STATUS
+                        last_error = f"{model}: {_describe(resp)}"
+                        log.error("Gemini stream %s rejected — %s", model, last_error)
+                        if not retryable:
+                            raise GeminiError(f"Gemini request failed. {last_error}")
+                        continue
 
-                if index:
-                    log.warning("Gemini streamed on fallback model %s", model)
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    chunk = line[5:].strip()
-                    if not chunk or chunk == "[DONE]":
-                        continue
-                    try:
-                        parsed = json.loads(chunk)
-                    except json.JSONDecodeError:
-                        continue
-                    try:
-                        text = _text_from(parsed)
-                    except GeminiError:
-                        continue  # a token-only chunk with no text parts
-                    if text:
-                        emitted = True
-                        yield text
-                return
-        except httpx.HTTPError as exc:
-            last_error = f"{model}: {type(exc).__name__}: {exc}"
-            log.error("Gemini stream to %s failed: %s", model, last_error)
-            if emitted:
-                raise GeminiError(f"Gemini stream broke mid-answer. {last_error}") from exc
-            continue
+                    if index or attempt:
+                        log.warning(
+                            "Gemini streamed on fallback model %s (pass %d)", model, attempt + 1
+                        )
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        chunk = line[5:].strip()
+                        if not chunk or chunk == "[DONE]":
+                            continue
+                        try:
+                            parsed = json.loads(chunk)
+                        except json.JSONDecodeError:
+                            continue
+                        try:
+                            text = _text_from(parsed)
+                        except GeminiError:
+                            continue  # a signature/thought-only chunk carries no text
+                        if text:
+                            emitted = True
+                            yield text
+                    return
+            except GeminiError:
+                raise
+            except httpx.HTTPError as exc:
+                retryable = True
+                last_error = f"{model}: {type(exc).__name__}: {exc}"
+                log.error("Gemini stream to %s failed: %s", model, last_error)
+                if emitted:
+                    raise GeminiError(f"Gemini stream broke mid-answer. {last_error}") from exc
+                continue
+        if not retryable or emitted:
+            break
 
     raise GeminiError(f"Gemini request failed. {last_error or 'no model available'}")
