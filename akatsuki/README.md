@@ -136,6 +136,28 @@ router / synthesizer -> llm.chat_json | chat_markdown | chat_markdown_stream
 * `GET /health` reports `llm.primary`, `gemini_configured` and which provider
   served the last request.
 
+## 8. Weather feeds: shared-IP rate limits
+
+Open-Meteo's free endpoints are rate limited **by IP**, and this backend shares
+its egress IP with everything else on the host — so a marine answer can fail
+with `Daily API request limit exceeded` for reasons that have nothing to do with
+this app. How the platform copes, in order:
+
+1. **Caching** — readings live 20 minutes and the dashboard snapshot 3 minutes.
+   The upstream publishes on a ~15-minute cadence, so no freshness is lost while
+   traffic drops by an order of magnitude.
+2. **One short retry** — a 429 that says "try again in one minute" is a burst
+   limit and is retried with backoff. A 429 that says "try again tomorrow" is a
+   hard daily limit, so it is reported immediately with Open-Meteo's own wording
+   instead of making the user wait.
+3. **Partial readings** — the wave/SST product and the wind/weather product are
+   fetched independently, so one being limited no longer discards the other. The
+   result is labelled `partial`, the missing feed is named in the answer, and the
+   confidence engine treats it as at most moderate (never high).
+4. **Your own quota** — set `OPEN_METEO_API_KEY` and the same products are
+   requested from the customer hosts against your account's quota, which removes
+   the shared-IP coupling entirely.
+
 ## Two things most likely to bite you
 1. **pgvector codec**: `pgvector.asyncpg.register_vector(conn)` must run on every connection before
    any `::vector` query, or asyncpg throws "no codec for type vector".

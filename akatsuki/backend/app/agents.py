@@ -643,11 +643,19 @@ def _context(state: AgentState) -> str:
 
     w = state.get("weather_data")
     if w:
+        partial = w.get("partial_feeds") or []
         parts.append(
-            "WEATHER (Open-Meteo, live): " + ", ".join(
-                f"{k}={v}" for k, v in w.items() if k != "forecast_days"
+            f"WEATHER ({w.get('source', 'live feed')}): " + ", ".join(
+                f"{k}={v}" for k, v in w.items() if k not in ("forecast_days", "source")
             )
         )
+        if partial:
+            parts.append(
+                "IMPORTANT: this reading is PARTIAL — "
+                + "; ".join(str(p) for p in partial)
+                + ". The fields above are real, but the missing ones are unknown for this "
+                "location: say which part could not be read instead of estimating it."
+            )
         days = w.get("forecast_days") or []
         if days:
             parts.append("DAY BY DAY (today and the next two days):")
@@ -656,6 +664,10 @@ def _context(state: AgentState) -> str:
                 parts.append(f"  - {fields}")
     else:
         parts.append("WEATHER: no live weather/sea-state reading is available for this question.")
+        parts.append(
+            "IMPORTANT: do not describe sea state, wind or waves for this location at all — "
+            "say the live reading could not be retrieved."
+        )
 
     g = state.get("geospatial_data") or {}
     if g.get("checked"):

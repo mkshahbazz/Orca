@@ -17,8 +17,27 @@ import time
 
 import httpx
 
-MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
-FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+from app.config import settings
+
+# Open-Meteo's free tier is rate-limited **by IP**, and this service shares its
+# egress IP with everything else on the host — so the free endpoints can return
+# 429 "daily limit exceeded" for reasons that have nothing to do with this app.
+# With an API key the same products are served from the customer hosts against
+# the account's own (much larger) quota, which removes that coupling entirely.
+# Both hosts take the same parameter names, so the only difference is the URL and
+# the `apikey` parameter — see `_urls()`.
+_MARINE_FREE = "https://marine-api.open-meteo.com/v1/marine"
+_FORECAST_FREE = "https://api.open-meteo.com/v1/forecast"
+_MARINE_KEYED = "https://customer-marine-api.open-meteo.com/v1/marine"
+_FORECAST_KEYED = "https://customer-api.open-meteo.com/v1/forecast"
+
+
+def _urls() -> tuple[str, str, str]:
+    """(marine url, forecast url, apikey) for the configured tier."""
+    key = settings.open_meteo_api_key.strip()
+    if key:
+        return _MARINE_KEYED, _FORECAST_KEYED, key
+    return _MARINE_FREE, _FORECAST_FREE, ""
 
 MARINE_CURRENT = (
     "wave_height,wave_direction,wave_period,wind_wave_height,"
@@ -223,6 +242,7 @@ async def get_marine_conditions(lat: float | None = None, lon: float | None = No
     if hit is not None:
         return dict(hit, cached=True)
 
+    marine_url, forecast_url, api_key = _urls()
     params = {
         "marine": {"latitude": lat, "longitude": lon,
                    "current": MARINE_CURRENT, "daily": MARINE_DAILY,
@@ -231,29 +251,48 @@ async def get_marine_conditions(lat: float | None = None, lon: float | None = No
                      "current": FORECAST_CURRENT, "daily": FORECAST_DAILY,
                      "forecast_days": 3, "timezone": "auto"},
     }
+    if api_key:
+        for body in params.values():
+            body["apikey"] = api_key
 
     client = _ensure_client()
-    try:
-        async with asyncio.timeout(24):
-            m_body, f_body = await asyncio.gather(
-                _get_json(client, MARINE_URL, params["marine"], "marine/wave feed"),
-                _get_json(client, FORECAST_URL, params["forecast"], "wind/weather feed"),
-            )
-            mj = m_body["current"]
-            fj = f_body["current"]
-    except WeatherUnavailable as exc:
-        # Already a plain, honest sentence (with the provider's own reason).
+    # The two products fail independently — waves can be readable while the wind
+    # forecast is rate-limited — so one failing feed must not discard the other.
+    # Whatever is missing is reported as missing, never filled in.
+    marine_result, forecast_result = await asyncio.gather(
+        _get_json(client, marine_url, params["marine"], "marine/wave feed"),
+        _get_json(client, forecast_url, params["forecast"], "wind/weather feed"),
+        return_exceptions=True,
+    )
+
+    def _feed(result, label: str):
+        if isinstance(result, Exception):
+            return None, f"{label}: {result}"
+        if not isinstance(result, dict) or not isinstance(result.get("current"), dict):
+            return None, f"{label}: the response carried no current readings"
+        return result, None
+
+    m_body, m_error = _feed(marine_result, "marine/wave feed")
+    f_body, f_error = _feed(forecast_result, "wind/weather feed")
+    errors = [e for e in (m_error, f_error) if e]
+    if m_body is None and f_body is None:
         raise WeatherUnavailable(
-            f"Live weather/sea-state feeds could not be read for {lat:.3f}, {lon:.3f}: {exc}"
-        ) from exc
-    except Exception as exc:  # malformed payload -> also tell the truth
-        raise WeatherUnavailable(
-            f"Live weather/sea-state feeds returned an unusable answer for "
-            f"{lat:.3f}, {lon:.3f} ({type(exc).__name__}: {exc})"
-        ) from exc
+            f"Live weather/sea-state feeds could not be read for {lat:.3f}, {lon:.3f}. "
+            + " | ".join(errors)
+        )
+
+    mj = (m_body or {}).get("current") or {}
+    fj = (f_body or {}).get("current") or {}
 
     data = {
-        "lat": lat, "lon": lon, "source": "Open-Meteo (live)",
+        "lat": lat, "lon": lon,
+        # A partial reading says so in its own source label, so neither the
+        # answer nor the confidence score can mistake it for a full picture.
+        "source": (
+            "Open-Meteo (live)" if not errors
+            else f"Open-Meteo (live, partial — {'; '.join(errors)})"
+        ),
+        "partial_feeds": errors,
         "wave_height_m": _round(mj.get("wave_height")),
         "wave_direction_deg": _round(mj.get("wave_direction"), 0),
         "wave_period_s": _round(mj.get("wave_period")),
@@ -269,7 +308,9 @@ async def get_marine_conditions(lat: float | None = None, lon: float | None = No
         "weather_code": fj.get("weather_code"),
         # today + the two following days, so "what about tomorrow?" can be
         # answered for the requested location from the same fetched payload
-        "forecast_days": _daily(m_body.get("daily") or {}, f_body.get("daily") or {}),
+        "forecast_days": _daily(
+            (m_body or {}).get("daily") or {}, (f_body or {}).get("daily") or {}
+        ),
     }
     _cache_put(key, data)
     return dict(data, cached=False)
@@ -285,18 +326,21 @@ async def probe_water_points(points: list[tuple[float, float]]) -> list[float | 
     """
     if not points:
         return []
+    marine_url, _, api_key = _urls()
     params = {
         "latitude": ",".join(f"{p[0]:.3f}" for p in points),
         "longitude": ",".join(f"{p[1]:.3f}" for p in points),
         "current": "wave_height",
         "timezone": "auto",
     }
+    if api_key:
+        params["apikey"] = api_key
     try:
         async with asyncio.timeout(10):
-            resp = await _ensure_client().get(MARINE_URL, params=params)
+            resp = await _ensure_client().get(marine_url, params=params)
             resp.raise_for_status()
             payload = resp.json()
-    except Exception:
+    except Exception:  # unreachable feed -> all-null, caller uses the feature centre
         return [None] * len(points)
 
     rows = payload if isinstance(payload, list) else [payload]

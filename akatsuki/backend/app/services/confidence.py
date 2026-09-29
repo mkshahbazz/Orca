@@ -44,12 +44,19 @@ _MAX_PURE_GUESS = 28
 
 
 def _weather_state(weather: dict | None) -> str:
-    """'live' | 'cached' | 'none'"""
+    """'live' | 'partial' | 'cached' | 'none'
+
+    A reading whose wave or wind feed was unavailable is 'partial', not 'live':
+    half a picture must not be scored as a complete one. It is still real data
+    (it is worth more than a cache hit), but it cannot reach the high band.
+    """
     if not weather:
         return "none"
     source = str(weather.get("source", "")).lower()
     if "live" not in source:
         return "none"
+    if weather.get("partial_feeds"):
+        return "partial"
     return "cached" if weather.get("cached") else "live"
 
 
@@ -80,6 +87,10 @@ def score_answer(
     if weather_state == "live":
         score += 20
         factors.append("live weather sensors")
+    elif weather_state == "partial":
+        score += 8
+        missing = (state.get("weather_data") or {}).get("partial_feeds") or []
+        factors.append(f"partial live feed ({'; '.join(str(m) for m in missing)[:80]})")
     elif weather_state == "cached":
         score += 10
         factors.append("cached weather sensors")
@@ -129,7 +140,7 @@ def score_answer(
     # ---- policy caps (applied before floors so thresholds stay honest) ----
     if not coords:
         score = min(score, _MAX_WITHOUT_LOCATION)
-    if weather_state == "cached":
+    if weather_state in ("cached", "partial"):
         score = min(score, _MAX_WITH_CACHED_ONLY)
 
     # ---- floors: vague-but-grounded answers are moderate, not useless ----
@@ -186,6 +197,12 @@ def _justification(
                 "satellite PFZ bulletin"
             )
         return " and ".join(parts) + "."
+
+    if weather_state == "partial":
+        return (
+            "Only part of the live reading arrived — one of the weather/ocean feeds did not "
+            "answer for this location, so this is a partial picture rather than a confirmed one."
+        )
 
     if weather_state == "cached":
         tail = " and authoritative spatial hazard checks" if geo_checked else ""

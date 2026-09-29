@@ -13,6 +13,11 @@ class Settings(BaseSettings):
     # briefly unavailable under load; that must not take the assistant down).
     gemini_model: str = "gemini-3.5-flash"
     gemini_fallback_models: str = "gemini-flash-latest,gemini-2.5-flash"
+    # Optional Open-Meteo customer API key. The free endpoints are rate-limited
+    # by IP, and this service shares its egress IP with everything else on the
+    # host, so a key (which bills against the account's own quota) removes that
+    # coupling. Without it the free endpoints are used exactly as before.
+    open_meteo_api_key: str = ""
     supabase_url: str = ""
     supabase_service_role_key: str = ""
     # Public Storage bucket that holds fisher-contributed photos/video.

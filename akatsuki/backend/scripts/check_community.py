@@ -182,6 +182,27 @@ def check_confidence() -> None:
     check("sensor-corroborated reports are labelled as such",
           any("sensor-corroborated" in f for f in with_one["factors"]), str(with_one["factors"]))
 
+    # A reading whose wave or wind feed did not answer must not be scored as a
+    # complete live reading — that is the whole point of the partial state.
+    partial_state = {
+        **base_state,
+        "weather_data": {
+            **ROUGH,
+            "source": "Open-Meteo (live, partial — wind/weather feed: HTTP 429)",
+            "partial_feeds": ["wind/weather feed: HTTP 429"],
+        },
+    }
+    partial = confidence.score_answer(partial_state, verified_reports=[])
+    check("a partial live reading scores below a complete one",
+          partial["score"] < plain["score"], f"{partial['score']} vs {plain['score']}")
+    check("a partial live reading cannot reach the high band",
+          partial["label"] != "high", partial["label"])
+    check("a partial live reading says which feed was missing",
+          any("partial" in f for f in partial["factors"]), str(partial["factors"]))
+    check("the justification names the partial reading",
+          "partial" in partial["justification"].lower() or "part of" in partial["justification"].lower(),
+          partial["justification"])
+
     guess = confidence.score_answer({}, verified_reports=[])
     check("an evidence-free answer cannot claim high confidence", guess["score"] <= 28, str(guess["score"]))
     # a stored/verified claim may not be passed in as if it were sensor evidence
