@@ -195,14 +195,18 @@ async def _build_snapshot() -> dict:
     }
 
 
+SNAPSHOT_TTL = 180  # seconds — see the note in services/weather.py: the upstream
+                    # provider rates by IP, and the console polls this endpoint.
+
+
 @router.get("/api/dashboard")
 async def dashboard_snapshot():
-    """One aggregated snapshot for the whole dashboard (60s micro-cache)."""
+    """One aggregated snapshot for the whole dashboard (3-minute micro-cache)."""
     global _snapshot
     now = time.monotonic()
     if _snapshot is None or _snapshot[0] < now:
         try:
-            _snapshot = (now + 60, await _build_snapshot())
+            _snapshot = (now + SNAPSHOT_TTL, await _build_snapshot())
         except Exception as exc:  # degrade, never 500 the dashboard
             return {"status": "degraded", "error": str(exc), "generated_at": _ist_now().isoformat()}
     return _snapshot[1]
@@ -277,9 +281,9 @@ async def _build_systems() -> dict:
 
 @router.get("/api/health/systems")
 async def systems_health():
-    """Footer pipeline indicators (60s micro-cache)."""
+    """Footer pipeline indicators (3-minute micro-cache, same reason)."""
     global _systems
     now = time.monotonic()
     if _systems is None or _systems[0] < now:
-        _systems = (now + 60, await _build_systems())
+        _systems = (now + SNAPSHOT_TTL, await _build_systems())
     return _systems[1]

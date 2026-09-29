@@ -61,6 +61,17 @@ def _clean_name(name: str | None) -> str:
     return cleaned or "Anonymous"
 
 
+def _unavailable(exc: Exception, what: str) -> HTTPException:
+    """Report a backend failure as itself, not as an opaque 500.
+
+    `community.list_reports` and friends raise plain RuntimeErrors (including the
+    "run this migration" hint) so the reason reaches the page instead of being
+    flattened into "Internal Server Error".
+    """
+    log.error("%s failed: %s", what, exc)
+    return HTTPException(status_code=503, detail=str(exc))
+
+
 def _validate(body: ReportIn) -> None:
     if body.category not in community.ALL_CATEGORIES:
         raise HTTPException(
@@ -232,14 +243,17 @@ async def list_reports(
     used there) and on by default for the Contribute page's small window.
     `POST /reports/{id}/verify` re-checks a single report on demand.
     """
-    if lat is not None and lon is not None:
-        rows = await community.find_nearby_reports(
-            lat, lon, radius_km=radius_km, max_age_hours=max_age_hours, limit=limit
-        )
-    else:
-        rows = await community.list_reports(
-            limit=limit, verified_only=verified_only, max_age_hours=max_age_hours
-        )
+    try:
+        if lat is not None and lon is not None:
+            rows = await community.find_nearby_reports(
+                lat, lon, radius_km=radius_km, max_age_hours=max_age_hours, limit=limit
+            )
+        else:
+            rows = await community.list_reports(
+                limit=limit, verified_only=verified_only, max_age_hours=max_age_hours
+            )
+    except Exception as exc:
+        raise _unavailable(exc, "listing community reports") from exc
 
     if reverify and rows:
         rows = await _reverify_rows(rows)
@@ -307,7 +321,10 @@ async def create_report(body: ReportIn):
 @router.post("/reports/{report_id}/verify")
 async def reverify(report_id: int):
     """Re-run the verification matrix for one stored report (one live lookup)."""
-    rows = await community.list_reports(limit=100, max_age_hours=24 * 365)
+    try:
+        rows = await community.list_reports(limit=100, max_age_hours=24 * 365)
+    except Exception as exc:
+        raise _unavailable(exc, "reading a report to re-verify") from exc
     match = next((r for r in rows if str(r.get("id")) == str(report_id)), None)
     if not match:
         raise HTTPException(status_code=404, detail=f"Report {report_id} was not found.")
@@ -346,7 +363,7 @@ async def contributor_leaderboard(limit: int = Query(25, gt=0, le=100)):
     try:
         return {"contributors": await contributors.leaderboard(limit)}
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise _unavailable(exc, "reading the contributor leaderboard") from exc
 
 
 @router.get("/contributors/{name}")
@@ -354,7 +371,7 @@ async def contributor_card(name: str):
     try:
         card = await contributors.for_name(name)
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise _unavailable(exc, "reading a contributor record") from exc
     if card is None:
         return {
             "contributor": contributor_payload(_clean_name(name), 0, 0),
@@ -369,4 +386,4 @@ async def stats(max_age_hours: int = Query(24 * 30, gt=0, le=24 * 365)):
     try:
         return await community.report_stats(max_age_hours=max_age_hours)
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise _unavailable(exc, "reading community stats") from exc

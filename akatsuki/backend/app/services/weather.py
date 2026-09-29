@@ -46,7 +46,12 @@ class WeatherUnavailable(RuntimeError):
     """Raised when live marine/weather data cannot be retrieved."""
 
 # ---------------------------------------------------------------- caching
-_CACHE_TTL = 600          # seconds
+# Marine data is published on a ~15-minute cadence upstream, so a 20-minute
+# cache costs no freshness but removes most of the traffic. That matters more
+# than it looks: this backend shares its egress IP with every other service on
+# the host, and Open-Meteo rates *by IP* — so the fewer calls the console makes,
+# the fewer 429s every one of those services sees.
+_CACHE_TTL = 1200         # seconds
 _CACHE_MAX = 512          # simple size cap
 _cache: dict[str, tuple[float, dict]] = {}
 _cache_lock = asyncio.Lock()
@@ -142,6 +147,60 @@ def _daily(mj: dict, fj: dict) -> list[dict]:
     return out
 
 
+RETRY_STATUS = (429, 500, 502, 503, 504)
+MAX_ATTEMPTS = 3
+# Open-Meteo says "try again in one minute" for a burst limit and "try again
+# tomorrow" for a daily one. Backing off fixes the first; retrying the second
+# only burns time, so a daily-limit answer is reported immediately.
+_DAILY_LIMIT = ("tomorrow", "daily")
+
+
+def _provider_reason(resp: httpx.Response) -> str:
+    """Open-Meteo's own explanation, e.g. 'Minutely API request limit exceeded…'."""
+    try:
+        body = resp.json()
+    except Exception:
+        return ""
+    if isinstance(body, dict):
+        reason = body.get("reason") or body.get("error")
+        if isinstance(reason, str):
+            return reason.strip()
+    return ""
+
+
+async def _get_json(
+    client: httpx.AsyncClient, url: str, params: dict, label: str
+) -> dict:
+    """GET with a bounded, reason-aware retry.
+
+    A 429 from a shared cloud IP is usually a burst limit, so one short backoff
+    usually clears it. A daily limit is *not* retried — it is reported with the
+    provider's own wording, because pretending otherwise would just make the
+    user wait for an answer that cannot come.
+    """
+    last = "no attempt was made"
+    for attempt in range(MAX_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(0.6 * (3 ** (attempt - 1)))
+        try:
+            resp = await client.get(url, params=params)
+        except Exception as exc:
+            last = f"{type(exc).__name__}: {exc}"
+            continue
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code in RETRY_STATUS:
+            reason = _provider_reason(resp)
+            last = f"HTTP {resp.status_code}" + (f" — {reason}" if reason else "")
+            if any(word in reason.lower() for word in _DAILY_LIMIT):
+                break
+            continue
+        # any other status is a request problem, not a transient one
+        last = f"HTTP {resp.status_code}" + (f" — {_provider_reason(resp)}" or "")
+        break
+    raise WeatherUnavailable(f"{label} unavailable from Open-Meteo ({last})")
+
+
 async def get_marine_conditions(lat: float | None = None, lon: float | None = None) -> dict:
     """Live waves + SST (marine API) and wind/weather (forecast API).
 
@@ -175,20 +234,21 @@ async def get_marine_conditions(lat: float | None = None, lon: float | None = No
 
     client = _ensure_client()
     try:
-        async with asyncio.timeout(8):
-            m_resp, f_resp = await asyncio.gather(
-                client.get(MARINE_URL, params=params["marine"]),
-                client.get(FORECAST_URL, params=params["forecast"]),
+        async with asyncio.timeout(24):
+            m_body, f_body = await asyncio.gather(
+                _get_json(client, MARINE_URL, params["marine"], "marine/wave feed"),
+                _get_json(client, FORECAST_URL, params["forecast"], "wind/weather feed"),
             )
-            m_resp.raise_for_status()
-            f_resp.raise_for_status()
-            m_body = m_resp.json()
-            f_body = f_resp.json()
             mj = m_body["current"]
             fj = f_body["current"]
-    except Exception as exc:  # offline / rate-limited / timeout -> tell the truth
+    except WeatherUnavailable as exc:
+        # Already a plain, honest sentence (with the provider's own reason).
         raise WeatherUnavailable(
-            f"Live weather/sea-state feeds could not be reached for "
+            f"Live weather/sea-state feeds could not be read for {lat:.3f}, {lon:.3f}: {exc}"
+        ) from exc
+    except Exception as exc:  # malformed payload -> also tell the truth
+        raise WeatherUnavailable(
+            f"Live weather/sea-state feeds returned an unusable answer for "
             f"{lat:.3f}, {lon:.3f} ({type(exc).__name__}: {exc})"
         ) from exc
 
