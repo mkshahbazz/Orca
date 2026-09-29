@@ -215,6 +215,30 @@ def check_confidence() -> None:
     check("the justification does not claim live readings were unavailable",
           "unavailable" not in why.lower(), why)
 
+    # An unavailable knowledge base must not be scored as if it had been read.
+    kb_down = confidence.score_answer(
+        {
+            "coordinates": {"lat": 21.0, "lon": 87.5},
+            "weather_data": ROUGH,
+            "advisory_data": {"matches": [], "unavailable": "embedding provider down"},
+        },
+        verified_reports=[],
+    )
+    check("an unsearched knowledge base earns no advisory factor",
+          not any("knowledge base" in f for f in kb_down["factors"]), str(kb_down["factors"]))
+    kb_up = confidence.score_answer(
+        {
+            "coordinates": {"lat": 21.0, "lon": 87.5},
+            "weather_data": ROUGH,
+            "advisory_data": {"matches": [{"similarity": 0.72, "title": "monsoon"}]},
+        },
+        verified_reports=[],
+    )
+    check("a searched knowledge base still earns its advisory factor",
+          any("knowledge base" in f for f in kb_up["factors"]), str(kb_up["factors"]))
+    check("a missing knowledge base lowers confidence",
+          kb_down["score"] < kb_up["score"], f"{kb_down['score']} vs {kb_up['score']}")
+
     guess = confidence.score_answer({}, verified_reports=[])
     check("an evidence-free answer cannot claim high confidence", guess["score"] <= 28, str(guess["score"]))
     # a stored/verified claim may not be passed in as if it were sensor evidence

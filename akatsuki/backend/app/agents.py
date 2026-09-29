@@ -24,6 +24,7 @@ the location resolved last time (`context`). The router sees both, so "is the
 wind strong?" after a Chennai answer is understood as Chennai.
 """
 import asyncio
+import logging
 import re
 from typing import Any, AsyncIterator, TypedDict
 
@@ -32,6 +33,8 @@ from langgraph.types import Send
 
 from app.llm import LLMUnavailable, chat_json, chat_markdown, chat_markdown_stream
 from app.services import advisory, community, confidence, geospatial, incois, location, weather
+
+log = logging.getLogger("marine.agents")
 
 # ---------------------------------------------------------------- state
 class AgentState(TypedDict, total=False):
@@ -484,8 +487,20 @@ async def pfz_node(state: AgentState) -> dict:
 
 
 async def advisory_node(state: AgentState) -> dict:
-    """Knowledge-base matches. A failing vector search fails the run honestly."""
-    matches = await advisory.match_advisories(state["message"])
+    """Knowledge-base matches.
+
+    A vector search that cannot run (embedding provider down, database
+    unreachable) is reported as a *missing dataset*, not as an empty one: the
+    run continues so live feeds can still answer, the state carries the reason,
+    the writer is told the knowledge base was unavailable, and the confidence
+    engine simply never counts the advisory evidence it did not get. Nothing is
+    substituted for it.
+    """
+    try:
+        matches = await advisory.match_advisories(state["message"])
+    except advisory.AdvisoryUnavailable as exc:
+        log.warning("advisory knowledge base unavailable: %s", exc)
+        return {"advisory_data": {"matches": [], "unavailable": str(exc)}}
     return {"advisory_data": {"matches": matches}}
 
 
@@ -698,8 +713,19 @@ def _context(state: AgentState) -> str:
             advisory_lines.append(
                 f"ADVISORY [{m.get('category')}] {m.get('title')}: {(m.get('content') or '')[:400]}"
             )
-    parts.append("\n".join(advisory_lines) if advisory_lines
-                 else "ADVISORY: nothing relevant found in the advisory knowledge base.")
+    if advisory_lines:
+        parts.append("\n".join(advisory_lines))
+    elif a.get("unavailable"):
+        # Say which dataset is missing rather than implying the knowledge base
+        # was searched and had nothing relevant.
+        parts.append(
+            "ADVISORY KNOWLEDGE BASE: NOT SEARCHED for this question — "
+            f"{a['unavailable']} Do not present published safety guidance as if it came "
+            "from it; rely on the live feeds above and say the guidance library could not "
+            "be consulted."
+        )
+    else:
+        parts.append("ADVISORY: nothing relevant found in the advisory knowledge base.")
 
     cd = state.get("community_data") or {}
     if cd.get("searched"):
