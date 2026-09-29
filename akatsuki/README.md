@@ -12,9 +12,17 @@ categories, indexes) and creates the public `community-media` Storage bucket:
 supabase/migrations/001_community_contribution.sql   -- SQL Editor → Run
 ```
 
-It is `if not exists` throughout, so running it twice is harmless. Without it,
-`/api/community/*` reports the missing migration by name instead of failing
+It creates the table if it is missing as well as extending an existing one, and
+every statement is `if not exists` / `drop … if exists`, so running it twice is
+harmless and the same paste is correct on any project state. Without it,
+`/api/community/*` answers 503 with the migration's name instead of failing
 mysteriously.
+
+Verify it took effect:
+```bash
+curl -s https://orca-backend-nxed.onrender.com/api/community/stats
+# {"total":0,"verified":0,...,"contributors":0,"with_media":0,...}
+```
 
 ## 1. Supabase (dashboard, not terminal)
 Create project → SQL Editor → paste `supabase/schema.sql` → Run. Verify:

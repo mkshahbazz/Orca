@@ -2,17 +2,51 @@
 -- 001 · Community contributions (Contribute page + recognition)
 -- Run in: Supabase Dashboard -> SQL Editor -> New query
 --
--- ADDITIVE ONLY. The community_reports table already existed with the
--- verification columns the agents use; this migration extends it in place
--- rather than creating a parallel store, so existing rows, the PostGIS
--- `location` column, its trigger and every existing query keep working.
+-- ADDITIVE and IDEMPOTENT. It brings `public.community_reports` to the shape the
+-- Contribute page needs whether that table is missing entirely (a project set up
+-- without this section of schema.sql) or already exists in an earlier form, so
+-- the same paste is correct in both cases and safe to run twice.
+--
+-- It does NOT touch hazard_zones, pfz_zones, marine_advisories or user_queries.
 -- ============================================================
 
--- 1) Contributor identity + media metadata -------------------------------
+create extension if not exists postgis;
+
+-- 1) The table itself ------------------------------------------------------
+-- Notes on the shape:
+--   · `location` is derived from lat/lon by a trigger below, so callers only
+--     ever send numbers (X = lon, Y = lat — PostGIS order).
+--   · category carries the six fisher-facing choices plus the original
+--     sensor-corroborated hazard categories, so old rows stay valid.
+create table if not exists public.community_reports (
+    id                  bigint generated always as identity primary key,
+    created_at          timestamptz not null default now(),
+    observed_at         timestamptz not null default now(),
+    category            text not null,
+    description         text not null,
+    reporter_role       text,
+    reporter_name       text,
+    media_url           text,
+    media_type          text,
+    lat                 double precision not null,
+    lon                 double precision not null,
+    location            geometry(Point, 4326),
+    verified            boolean not null default false,
+    verification_note   text,
+    verification_source text
+);
+
+-- 2) Columns an earlier version may be missing ----------------------------
 alter table public.community_reports
-    add column if not exists reporter_name text,
-    add column if not exists media_url     text,
-    add column if not exists media_type    text;   -- 'image' | 'video'
+    add column if not exists reporter_name       text,
+    add column if not exists media_url           text,
+    add column if not exists media_type          text,
+    add column if not exists reporter_role       text,
+    add column if not exists verified            boolean not null default false,
+    add column if not exists verification_note    text,
+    add column if not exists verification_source  text,
+    add column if not exists observed_at         timestamptz not null default now(),
+    add column if not exists created_at          timestamptz not null default now();
 
 comment on column public.community_reports.reporter_name is
     'Display name the contributor filed under; drives the trust/badge aggregate.';
@@ -21,15 +55,39 @@ comment on column public.community_reports.media_url is
 comment on column public.community_reports.verification_source is
     'Which feed corroborated the report: a live weather source, or the INCOIS PFZ bulletin.';
 
--- 2) Extend the category vocabulary -------------------------------------
--- The Contribute page offers six choices a fisherman immediately understands;
--- the original hazard categories stay valid so nothing already stored breaks.
+-- 3) Keep `location` in sync with lat/lon ---------------------------------
+-- The trigger is the only writer of the geometry column, so the API never has
+-- to know about PostGIS at all.
+create or replace function public.sync_community_location()
+returns trigger language plpgsql as $$
+begin
+    new.location := ST_SetSRID(ST_MakePoint(new.lon, new.lat), 4326);
+    return new;
+end;
+$$;
+
+drop trigger if exists community_reports_sync_location on public.community_reports;
+create trigger community_reports_sync_location
+    before insert or update of lat, lon on public.community_reports
+    for each row execute function public.sync_community_location();
+
+-- Backfill any row written before the trigger existed, then lock the column
+-- down so a position-less report can never be stored.
+update public.community_reports
+   set location = ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+ where location is null;
+
+alter table public.community_reports alter column location set not null;
+
+-- 4) Constraints ----------------------------------------------------------
+-- Dropped and re-added so a fresh table and an older one converge on exactly
+-- the same rule; the new list is a superset of the original, so no stored row
+-- can violate it.
 alter table public.community_reports
     drop constraint if exists community_reports_category_check;
-
 alter table public.community_reports
     add constraint community_reports_category_check check (category in (
-        -- fisher-facing contribution categories
+        -- Contribute page choices
         'catch', 'hazard', 'sea_condition', 'fishing_zone',
         'weather_observation', 'other',
         -- original sensor-corroborated hazard categories (kept)
@@ -38,15 +96,17 @@ alter table public.community_reports
         'shoal', 'fish_sighting'
     ));
 
--- Media, when present, must be one of the two kinds the API accepts.
 alter table public.community_reports
     drop constraint if exists community_reports_media_type_check;
 alter table public.community_reports
     add constraint community_reports_media_type_check
         check (media_type is null or media_type in ('image', 'video'));
 
--- 3) Indexes for the Contribute page reads ------------------------------
--- Newest-reports listing, contributor aggregation, and verified-only filters.
+-- 5) Indexes --------------------------------------------------------------
+create index if not exists community_reports_geom_idx
+    on public.community_reports using gist (location);
+create index if not exists community_reports_observed_at_idx
+    on public.community_reports (observed_at desc);
 create index if not exists community_reports_reporter_idx
     on public.community_reports (reporter_name);
 create index if not exists community_reports_verified_idx
@@ -54,27 +114,30 @@ create index if not exists community_reports_verified_idx
 create index if not exists community_reports_category_idx
     on public.community_reports (category, observed_at desc);
 
--- 4) Storage bucket for contributed photos and video --------------------
--- Public-read so the browser can render media_url directly; writes go through
--- the backend only (service-role key), which is why there is no anon policy.
-insert into storage.buckets (id, name, public)
-values ('community-media', 'community-media', true)
-on conflict (id) do update set public = true;
-
--- Hard size cap enforced by the bucket itself (the API also validates type and
--- size before forwarding a single byte).
-update storage.buckets
-   set file_size_limit = 20971520,               -- 20 MB
-       allowed_mime_types = array[
-         'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif',
-         'video/mp4', 'video/quicktime', 'video/webm', 'video/3gpp',
-         'video/x-matroska'
-       ]
- where id = 'community-media';
-
--- Public read access to the bucket's objects (uploads stay server-side).
+-- 6) Storage bucket for contributed photos and video ----------------------
+-- Public-read so the browser can render `media_url` directly; writes go through
+-- the backend only (service-role key), which is why there is no anon insert
+-- policy. Guarded, because the storage schema only exists on Supabase.
 do $$
 begin
+    if to_regclass('storage.buckets') is null then
+        raise notice 'storage schema not present — skipping the community-media bucket';
+        return;
+    end if;
+
+    insert into storage.buckets (id, name, public)
+    values ('community-media', 'community-media', true)
+    on conflict (id) do update set public = true;
+
+    update storage.buckets
+       set file_size_limit = 20971520,               -- 20 MB, mirrored by the API
+           allowed_mime_types = array[
+             'image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif',
+             'video/mp4', 'video/quicktime', 'video/webm', 'video/3gpp',
+             'video/x-matroska'
+           ]
+     where id = 'community-media';
+
     if not exists (
         select 1 from pg_policies
          where schemaname = 'storage'
@@ -87,12 +150,14 @@ begin
     end if;
 end $$;
 
--- 5) Sanity checks ------------------------------------------------------
--- Every report carries a position (the original trigger fills `location`):
---   select count(*) from public.community_reports where location is null;  -- 0
--- Category distribution after the Contribute page has been used:
---   select category, count(*), count(*) filter (where verified) as verified
---     from public.community_reports group by 1 order by 2 desc;
+-- 7) Sanity checks --------------------------------------------------------
+-- The table is now present with the contribution columns:
+--   select count(*) from public.community_reports;                       -- 0 or more
+--   select column_name from information_schema.columns
+--    where table_name = 'community_reports' and column_name in
+--          ('reporter_name','media_url','media_type','location');        -- 4 rows
+-- The bucket exists:
+--   select id, public, file_size_limit from storage.buckets where id = 'community-media';
 -- Contributor trust, exactly as the API computes it:
 --   select coalesce(nullif(btrim(reporter_name), ''), 'Anonymous') as name,
 --          count(*) as contributions,
