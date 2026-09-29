@@ -2,7 +2,7 @@
 
 Unlike `check_conversation.py` (which stubs the provider so the pipeline can be
 inspected), this one talks to the actual `/api/chat` and `/api/chat/stream`
-endpoints, so the wire format, the SSE milestones and the fallback writer are
+endpoints, so the wire format, the SSE milestones and the honest error path are
 exercised exactly as a browser would exercise them.
 
 Usage:

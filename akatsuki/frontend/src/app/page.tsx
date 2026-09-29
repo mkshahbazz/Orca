@@ -38,6 +38,32 @@ const GATEWAY_QUESTIONS = [
   "Show today's marine forecast",
 ];
 
+/** Backend base URL — the same marine intelligence service the dashboard uses. */
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+/** Mirrors backend services/bhashini.py SUPPORTED_LANGUAGES. */
+const LANGS: Record<string, string> = {
+  en: "EN",
+  hi: "हिंदी",
+  bn: "বাংলা",
+  ta: "தமிழ்",
+  te: "తెలుగు",
+  mr: "मराठी",
+  gu: "ગુજરાતી",
+  kn: "ಕನ್ನಡ",
+  ml: "മലയാളം",
+  pa: "ਪੰਜਾਬੀ",
+  or: "ଓଡ଼ିଆ",
+  ur: "اردو",
+};
+
+type ChatMsg = {
+  role: "user" | "assistant";
+  content: string;
+  error?: boolean;
+  confidence?: { score: number; label: string; justification: string } | null;
+};
+
 const HeroScene = dynamic(() => import("@/components/hero/HeroScene"), {
   ssr: false,
 });
@@ -129,6 +155,129 @@ export default function SeamonkLanding() {
   const handleSceneStatus = useCallback((available: boolean) => {
     setWebgl(available);
   }, []);
+
+  /* ---------------- live Talk-to-the-Monk chat ---------------- */
+  const [msgs, setMsgs] = useState<ChatMsg[]>([]);
+  const [qInput, setQInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [stage, setStage] = useState("");
+  const [lang, setLang] = useState("en");
+  const logRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    logRef.current?.scrollTo({ top: logRef.current.scrollHeight, behavior: "smooth" });
+  }, [msgs, busy, stage]);
+
+  const patchLast = useCallback((patch: Partial<ChatMsg>) => {
+    setMsgs((m) => {
+      const next = [...m];
+      next[next.length - 1] = { ...next[next.length - 1], ...patch };
+      return next;
+    });
+  }, []);
+
+  const send = useCallback(
+    async (text: string) => {
+      const question = text.trim();
+      if (!question || busy) return;
+      setMsgs((m) => [...m, { role: "user", content: question }, { role: "assistant", content: "…" }]);
+      setQInput("");
+      setBusy(true);
+      setStage("Waking the Monk…");
+
+      let streamed = "";
+      let serverError: string | null = null;
+
+      const fail = (message: string) => {
+        patchLast({ content: `**Service unavailable:** ${message}`, error: true });
+      };
+
+      const consume = async (res: Response) => {
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        const handle = (event: string, raw: string) => {
+          if (!raw) return;
+          let data: any;
+          try {
+            data = JSON.parse(raw);
+          } catch {
+            return;
+          }
+          if (event === "token" && typeof data === "string") {
+            streamed += data;
+            patchLast({ content: streamed });
+          } else if (event === "status" && data?.label) {
+            setStage(data.label);
+          } else if (event === "final" && data?.response) {
+            patchLast({ content: data.response, confidence: data.confidence ?? null });
+          } else if (event === "error" && data?.message) {
+            serverError = data.message;
+          }
+        };
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let sep: number;
+          while ((sep = buffer.indexOf("\n\n")) !== -1) {
+            const block = buffer.slice(0, sep);
+            buffer = buffer.slice(sep + 2);
+            let event = "message";
+            const dataLines: string[] = [];
+            for (const line of block.split("\n")) {
+              if (line.startsWith("event:")) event = line.slice(6).trim();
+              else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+            }
+            handle(event, dataLines.join("\n"));
+          }
+        }
+      };
+
+      try {
+        const res = await fetch(`${API_URL}/api/chat/stream`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: question, language: lang }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => null);
+          fail(body?.detail || `the marine intelligence service replied ${res.status}`);
+          return;
+        }
+        if (res.body && res.headers.get("content-type")?.includes("text/event-stream")) {
+          await consume(res);
+        } else {
+          const data = await res.json();
+          patchLast({ content: data.response ?? "", confidence: data.confidence ?? null });
+        }
+        if (serverError) fail(serverError);
+      } catch {
+        // Transport-level failure — retry once over plain JSON.
+        try {
+          const res = await fetch(`${API_URL}/api/chat`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: question, language: lang }),
+          });
+          if (!res.ok) {
+            const body = await res.json().catch(() => null);
+            throw new Error(body?.detail || `the service replied ${res.status}`);
+          }
+          const data = await res.json();
+          patchLast({ content: data.response ?? "", confidence: data.confidence ?? null });
+        } catch (err: any) {
+          fail(err?.message || "the Monk could not be reached");
+        }
+      } finally {
+        setStage("");
+        setBusy(false);
+      }
+    },
+    [busy, lang, patchLast]
+  );
+
+  const submitQ = () => send(qInput);
 
   useEffect(() => {
     const stage = stageRef.current;
@@ -318,7 +467,7 @@ export default function SeamonkLanding() {
             </p>
           </section>
 
-          <aside className="gw-widget" aria-label="The Monk preview">
+          <aside className="gw-widget" aria-label="The Monk — live assistant">
             <div className="gw-widget-head">
               <div className="gw-widget-avatar">
                 <Waves size={19} strokeWidth={2.3} />
@@ -329,23 +478,82 @@ export default function SeamonkLanding() {
                   <i /> Online — listening to the ocean
                 </small>
               </div>
+              <select
+                className="gw-lang"
+                value={lang}
+                onChange={(e) => setLang(e.target.value)}
+                title="Answer language (Bhashini translation)"
+                aria-label="Answer language"
+              >
+                {Object.entries(LANGS).map(([code, label]) => (
+                  <option key={code} value={code}>
+                    {label}
+                  </option>
+                ))}
+              </select>
             </div>
-            <div className="gw-widget-msg">
-              I am the Seamonk — ask me about fishing zones, voyage safety,
-              weather windows, or the state of the sea anywhere along the
-              coast.
+
+            <div className="gw-chat-log" ref={logRef} aria-live="polite">
+              {msgs.length === 0 ? (
+                <div className="gw-widget-msg">
+                  I am the Seamonk — ask me about fishing zones, voyage safety,
+                  weather windows, or the state of the sea anywhere along the
+                  coast.
+                </div>
+              ) : (
+                msgs.map((m, i) => (
+                  <div
+                    key={i}
+                    className={`gw-chat-msg ${m.role}${m.error ? " is-error" : ""}`}
+                  >
+                    {m.content}
+                    {m.role === "assistant" && m.confidence ? (
+                      <span
+                        className="gw-chat-conf"
+                        title={m.confidence.justification}
+                      >
+                        {m.confidence.score}% confidence · {m.confidence.label}
+                      </span>
+                    ) : null}
+                  </div>
+                ))
+              )}
+              {busy ? (
+                <div className="gw-chat-status" role="status">
+                  <i className="gw-chat-spin" aria-hidden />
+                  {stage || "Working…"}
+                </div>
+              ) : null}
             </div>
-            {GATEWAY_QUESTIONS.map((q) => (
-              <button key={q} className="gw-q" onClick={enterRealm}>
-                {q}
-                <ArrowRight size={14} />
-              </button>
-            ))}
+
+            {msgs.length === 0
+              ? GATEWAY_QUESTIONS.map((q) => (
+                  <button key={q} className="gw-q" onClick={() => send(q)}>
+                    {q}
+                    <ArrowRight size={14} />
+                  </button>
+                ))
+              : null}
+
             <div className="gw-widget-in">
-              Ask the ocean...
-              <span>
+              <input
+                className="gw-chat-input"
+                value={qInput}
+                onChange={(e) => setQInput(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && submitQ()}
+                placeholder="Ask the ocean..."
+                aria-label="Question for the Monk"
+                disabled={busy}
+              />
+              <button
+                type="button"
+                className="gw-chat-send"
+                onClick={submitQ}
+                disabled={busy || !qInput.trim()}
+                aria-label="Send question"
+              >
                 <Send size={13} />
-              </span>
+              </button>
             </div>
           </aside>
 

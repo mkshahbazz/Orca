@@ -30,7 +30,7 @@ from typing import Any, AsyncIterator, TypedDict
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from app.llm import LLMError, chat_json, chat_markdown, chat_markdown_stream
+from app.llm import chat_json, chat_markdown, chat_markdown_stream
 from app.services import advisory, community, confidence, geospatial, incois, location, weather
 
 # ---------------------------------------------------------------- state
@@ -57,7 +57,6 @@ class AgentState(TypedDict, total=False):
     pfz_data: dict[str, Any] | None
     advisory_data: dict[str, Any] | None
     community_data: dict[str, Any] | None
-    feed_errors: list[str]
     confidence: dict[str, Any] | None
     map_features: dict[str, Any] | None
     response: str
@@ -74,13 +73,13 @@ LOCATION_INTENTS = ("weather", "hazard_check")
 TASK_MAP = {
     "conversation": [],
     "weather":        ["weather", "community"],
-    "pfz_search":     ["pfz", "advisory", "community", "weather_lenient"],
+    "pfz_search":     ["pfz", "advisory", "community"],
     "hazard_check":   ["geospatial", "weather", "advisory", "community"],
-    "general_advisory": ["advisory", "weather_lenient"],
+    "general_advisory": ["advisory"],
 }
 
 # Workers that are meaningless without a resolved coordinate.
-_POINT_WORKERS = {"weather", "weather_lenient", "geospatial", "community"}
+_POINT_WORKERS = {"weather", "geospatial", "community"}
 
 # Human-readable milestones the UI shows while it waits (live status transparency).
 STATUS_LABELS = {
@@ -91,7 +90,6 @@ STATUS_LABELS = {
     "geospatial": "Checking hazard zones…",
     "pfz": "Fetching the PFZ bulletin…",
     "advisory": "Searching safety advisories…",
-    "weather_lenient": "Checking weather buoys…",
     "community": "Scanning community reports…",
     "verifying": "Cross-checking human reports against live sensors…",
     "synthesizing": "Writing the answer…",
@@ -442,7 +440,6 @@ def route_workers(state: AgentState) -> list[Send]:
         return [Send("conversation_node", payload)]
     node_map = {
         "weather": "weather_node",
-        "weather_lenient": "weather_node_lenient",
         "geospatial": "geospatial_node",
         "pfz": "pfz_node",
         "advisory": "advisory_node",
@@ -482,41 +479,14 @@ async def geospatial_node(state: AgentState) -> dict:
 
 
 async def pfz_node(state: AgentState) -> dict:
-    bulletin = await incois.get_pfz_bulletin()
-    if not (bulletin.get("geojson") or {}).get("features"):
-        # The spatial store has no active INCOIS rows right now — answer from
-        # the platform's operational zone model (the same source the dashboard
-        # map renders), enriched with live weather per zone.
-        try:
-            from app.dashboard import _pfz_features
-            feats = await _pfz_features()
-            if feats:
-                bulletin = {
-                    **bulletin,
-                    "zone_count": len(feats),
-                    "geojson": {"type": "FeatureCollection", "features": feats},
-                    "source": "Platform PFZ model (live-weather enriched)",
-                }
-        except Exception:
-            pass
-    return {"pfz_data": bulletin}
+    """The INCOIS bulletin as it actually is — an empty bulletin stays empty."""
+    return {"pfz_data": await incois.get_pfz_bulletin()}
 
 
 async def advisory_node(state: AgentState) -> dict:
-    try:
-        matches = await advisory.match_advisories(state["message"])
-    except Exception as exc:                      # embeddings not seeded yet
-        matches = [{"note": f"advisory RAG unavailable: {exc}"}]
+    """Knowledge-base matches. A failing vector search fails the run honestly."""
+    matches = await advisory.match_advisories(state["message"])
     return {"advisory_data": {"matches": matches}}
-
-
-async def weather_node_lenient(state: AgentState) -> dict:
-    """Weather for general questions: keep going when the feed is down so a
-    no-coordinate advisory question still gets its advisories answered."""
-    try:
-        return await weather_node(state)
-    except Exception as exc:
-        return {"feed_errors": [f"weather: {exc}"]}
 
 
 async def community_node(state: AgentState) -> dict:
@@ -728,10 +698,6 @@ def _context(state: AgentState) -> str:
     else:
         parts.append("COMMUNITY REPORTS: not searched (no location for this question).")
 
-    errors = state.get("feed_errors") or []
-    if errors:
-        parts.append("FEED FAILURES: " + "; ".join(errors))
-
     conf = state.get("confidence")
     if conf:
         parts.append(
@@ -763,295 +729,13 @@ def _prompt_for(state: AgentState) -> tuple[str, str]:
     return MARINE_SYS, _context(state)
 
 
-def _compass(deg: float | None) -> str:
-    if deg is None:
-        return ""
-    dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
-    return dirs[int((deg % 360) / 22.5) % 16]
-
-
-def _sea_verdict(wave_m: float | None, gusts_kmh: float | None) -> str:
-    """Plain-language verdict from observed values — same thresholds the
-    dashboard console uses, so the chat never contradicts the map."""
-    wave = wave_m if wave_m is not None else 99
-    gust = gusts_kmh if gusts_kmh is not None else 0
-    if wave < 1.5 and gust < 25:
-        return "**Favourable** — small craft can work the nearshore grounds."
-    if wave <= 2.5 and gust <= 40:
-        return "**Workable with caution** — larger vessels OK; small craft keep to sheltered water."
-    return "**Poor** — advise staying in harbour until the sea settles."
-
-
-def _wind_phrase(kmh: float, gusts: float | None) -> str:
-    """Plain reading of a wind speed — what it feels like, not the number again."""
-    if kmh < 12:
-        feel = "light"
-    elif kmh < 20:
-        feel = "a moderate breeze"
-    elif kmh < 30:
-        feel = "fairly fresh"
-    elif kmh < 40:
-        feel = "strong"
-    else:
-        feel = "very strong"
-    text = f"Winds are {feel}, around {round(kmh)} km/h"
-    if isinstance(gusts, (int, float)):
-        text += f", gusting to {round(gusts)} km/h"
-        if gusts >= kmh * 1.35 and gusts >= 30:
-            text += " — the gusts will make it feel rougher in spells"
-    return text + "."
-
-
-def _wave_phrase(height: float, period: float | None, direction_deg: float | None) -> str:
-    if height < 0.5:
-        feel = "very calm"
-    elif height < 1.0:
-        feel = "slight"
-    elif height < 1.5:
-        feel = "moderate but manageable"
-    elif height < 2.5:
-        feel = "moderately rough"
-    elif height < 3.5:
-        feel = "rough"
-    else:
-        feel = "very rough"
-    text = f"Waves are about {height} m — {feel} seas"
-    if isinstance(period, (int, float)):
-        text += f", arriving roughly every {round(period)} seconds"
-    text += "."
-    if height >= 1.5:
-        text += " Small boats should treat that as uncomfortable work."
-    elif height < 1.0:
-        text += " That is easy water for most craft."
-    if direction_deg is not None:
-        text += f" They are running from the {_compass(direction_deg)}."
-    return text
-
-
-def _focus(message: str) -> str:
-    """What the user asked about, so the writer can stay proportional."""
-    msg = message.lower()
-    if any(w in msg for w in ("wave", "swell", "sea state", "rough")):
-        return "waves"
-    if any(w in msg for w in ("wind", "gust", "breez")):
-        return "wind"
-    if any(w in msg for w in ("safe", "boat", "sail", "hazard", "danger", "venture")):
-        return "safety"
-    if any(w in msg for w in ("tomorrow", "forecast", "next day", "day after")):
-        return "forecast"
-    return "conditions"
-
-
-def _day_phrase(day: dict | None) -> str | None:
-    if not day:
-        return None
-    bits = [f"{day.get('date')}"]
-    if day.get("wave_max_m") is not None:
-        bits.append(f"waves up to {day['wave_max_m']} m")
-    if day.get("wind_max_kmh") is not None:
-        bits.append(f"winds to {day['wind_max_kmh']} km/h")
-    if day.get("gust_max_kmh") is not None:
-        bits.append(f"gusts to {day['gust_max_kmh']} km/h")
-    if day.get("weather"):
-        bits.append(str(day["weather"]).lower())
-    if day.get("rain_chance_pct"):
-        bits.append(f"{day['rain_chance_pct']}% chance of rain")
-    return ", ".join(bits)
-
-
-def _conversation_reply(message: str) -> str:
-    """A plain, honest reply for ordinary talk when the writer model is down.
-
-    Nothing about the sea is asserted here — the point of Requirement 1 is that
-    a greeting is answered as a greeting, not as a partly-filled marine brief.
-    """
-    msg = message.lower()
-    if re.search(r"\b(hi|hello|hey|good (morning|evening|afternoon)|namaste)\b", msg):
-        return "Hello! How can I help you with the sea today?"
-    if re.search(r"\b(thank|thanks|cheers|appreciate)\b", msg):
-        return "You're welcome. Ask me any time you want the conditions for a place."
-    if re.search(r"\b(bye|goodbye|see you|good night|goodnight)\b", msg):
-        return "Fair winds — the Monk is here whenever you need the sea read."
-    if re.search(r"\bhow are you\b|\bhow's it going\b", msg):
-        return "I'm well, thank you. What would you like to know about the sea?"
-    if re.search(r"\b(who are you|your name|what are you|about you)\b", msg):
-        return ("I'm the Seamonk, the assistant of this platform — I read live marine weather, "
-                "fishing-zone and safety data and explain what it means for a place.")
-    if re.search(r"\b(what can you do|what do you do|help|capabilit|features)\b", msg):
-        return ("I can explain live marine weather and sea state for any place or coordinates, "
-                "look up PFZ fishing zones, check recorded hazard zones for a position, "
-                "summarise voyage-safety advisories, and fold in reports from fishers. "
-                "Ask me about a place — for example “what is the weather in Chennai?”.")
-    if re.search(r"\b(ok|okay|great|nice|cool|got it|alright|sure|good)\b", msg):
-        return "Glad to help. Ask me whenever you want the conditions for a place."
-    return ("I'm listening. Ask me about conditions, fishing zones or safety for any place on "
-            "the coast and I'll explain what the data shows.")
-
-
-def _fallback_answer(state: AgentState, partial: str = "") -> str:
-    """Compose the answer from the live feeds when the AI writer is unreachable.
-
-    Used when the LLM provider is unreachable (quota exhausted, outage). The
-    wording is conversational — it explains what the readings mean instead of
-    listing them — and every number still comes from an observed/model feed.
-    """
-    if state.get("conversation") or state.get("intent") == "conversation":
-        # Ordinary conversation: no feeds were read, so nothing about the sea is
-        # reported — the user gets a reply, not an empty marine brief.
-        return partial or _conversation_reply(state["message"])
-
-    if state.get("needs_location"):
-        return _clarification(state)
-
-    loc = state.get("location") or {}
-    c = state.get("coordinates") or {}
-    where = loc.get("label") or (
-        f"{c['lat']:.2f}°N, {c['lon']:.2f}°E" if c else "your area"
-    )
-    sections: list[str] = [f"**{where}**"]
-    scope_note: list[str] = []
-
-    if loc and loc.get("scope") in ("region", "sea") and c:
-        kind = "water body" if loc.get("scope") == "sea" else "region"
-        scope_note.append(
-            f"{where} is a {kind}, so these readings are for a representative point at "
-            f"{c['lat']:.2f}°N, {c['lon']:.2f}°E"
-            + ("." if loc.get("scope") == "sea" else " inside it, not for the whole area.")
-        )
-    elif loc.get("representative") and c:
-        scope_note.append(
-            f"These readings come from the nearest water point to {where}, at "
-            f"{c['lat']:.2f}°N, {c['lon']:.2f}°E."
-        )
-
-    focus = _focus(state["message"])
-    w = state.get("weather_data")
-    sentences: list[str] = []
-    if w:
-        wave = w.get("wave_height_m")
-        if wave is not None and focus in ("waves", "conditions", "safety"):
-            sentences.append(_wave_phrase(
-                wave, w.get("wave_period_s"), w.get("wave_direction_deg")
-            ))
-        speed = w.get("wind_speed_kmh")
-        if speed is not None and focus in ("wind", "conditions", "safety"):
-            sentences.append(_wind_phrase(speed, w.get("wind_gusts_kmh")))
-        if wave is not None and focus == "wind":
-            sentences.append(_wave_phrase(wave, w.get("wave_period_s"), w.get("wave_direction_deg")))
-        if speed is not None and focus == "waves":
-            sentences.append(_wind_phrase(speed, w.get("wind_gusts_kmh")))
-        sky = []
-        if w.get("air_temperature_c") is not None:
-            sky.append(f"the air is around {w['air_temperature_c']} °C")
-        if w.get("sea_surface_temperature_c") is not None:
-            sky.append(f"the sea surface is {w['sea_surface_temperature_c']} °C")
-        if w.get("weather"):
-            sky.append(f"the sky is {str(w['weather']).lower()}")
-        if sky:
-            first = sky[0][0].upper() + sky[0][1:]
-            rest = ""
-            if len(sky) > 1:
-                rest = ", " + " and ".join(sky[1:])
-            sentences.append(f"{first}{rest}.")
-    sections.append(" ".join(sentences) if sentences else
-                    "I could not reach the live weather and sea-state feeds, so I have no "
-                    "observed conditions to report for this location right now.")
-
-    if w:
-        sections.append("Sea state: " + _sea_verdict(w.get("wave_height_m"), w.get("wind_gusts_kmh")))
-
-    days = (w or {}).get("forecast_days") or []
-    if focus == "forecast" and days:
-        parts = [p for p in (_day_phrase(d) for d in days[:2]) if p]
-        if parts:
-            sections.append("Day by day — " + "; ".join(parts) + ".")
-
-    if scope_note:
-        sections.append(" ".join(scope_note))
-
-    g = state.get("geospatial_data") or {}
-    if g.get("checked"):
-        zones = g.get("zones") or []
-        if zones:
-            z = zones[0]
-            sections.append(
-                f"⚠️ **Do not venture here.** This position falls inside the recorded hazard zone "
-                f"“{z.get('name')}” (severity {z.get('severity')}). {z.get('advisory') or ''}".strip()
-            )
-        else:
-            sections.append(
-                "No recorded hazard zone contains the queried position — that means nothing is "
-                "recorded here, not that the area is hazard-free."
-            )
-
-    p = state.get("pfz_data") or {}
-    feats = (p.get("geojson") or {}).get("features") or []
-    if feats and (state.get("intent") == "pfz_search" or focus in ("conditions", "safety")):
-        rows = []
-        for f in feats[:3]:
-            pr = f.get("properties") or {}
-            name = pr.get("location_name") or pr.get("name") or "zone"
-            prob = pr.get("probability")
-            rows.append(f"{name}" + (f" ({prob}% likelihood)" if isinstance(prob, (int, float)) else ""))
-        sections.append(
-            f"Fishing zones from the INCOIS bulletin ({p.get('zone_count', len(feats))} active): "
-            + "; ".join(rows) + "."
-        )
-
-    for m in ((state.get("advisory_data") or {}).get("matches") or [])[:1]:
-        if m.get("title"):
-            content = (m.get("content") or "").strip()
-            sections.append(
-                f"Advisory — **{m['title']}**"
-                + (f": {content[:200]}{'…' if len(content) > 200 else ''}" if content else "")
-            )
-
-    reports = ((state.get("community_data") or {}).get("reports") or [])
-    if reports:
-        trusted = [r for r in reports if r.get("verified")]
-        r0 = (trusted or reports)[0]
-        sections.append(
-            f"Community: {'a sensor-verified' if r0.get('verified') else 'an unverified'} report "
-            f"nearby — “{(r0.get('description') or '')[:150]}” ({r0.get('observed_at') or 'recent'})."
-        )
-
-    errors = state.get("feed_errors") or []
-    if errors:
-        sections.append(
-            f"{len(errors)} live feed(s) could not be reached just now, so this answer covers "
-            "only what responded."
-        )
-
-    drawn = []
-    if (g.get("geojson") or {}).get("features"):
-        drawn.append("hazard zones in red")
-    if (p.get("geojson") or {}).get("features"):
-        drawn.append("PFZ polygons in green")
-    if reports:
-        drawn.append("community pins in cyan")
-    if drawn:
-        sections.append("🛰️ Map: " + " and ".join(drawn) + " drawn on the chart.")
-
-    sections.append(
-        "_Assembled directly from the platform's live feeds — the AI writer is unavailable, so "
-        "no number here is paraphrased._"
-    )
-    if partial:
-        sections = [partial, "", "---", *sections]
-    return "\n\n".join(s for s in sections if s)
-
-
 async def synthesize_node(state: AgentState) -> dict:
-    """gpt-4o natural-language answer; falls back to a live-feed brief when the
-    provider is down (quota/outage) so the Monk still answers from real data."""
+    """gpt-4o natural-language answer. Provider failures propagate — never faked."""
     if state.get("needs_location"):
         return {"response": _clarification(state), "map_features": None}
     map_features = _merge_features(state)
     system, user = _prompt_for(state)
-    try:
-        response = await chat_markdown(system, user)
-    except LLMError:
-        response = _fallback_answer(state)
+    response = await chat_markdown(system, user)
     # Trimmed payload: the big geojson blobs are already merged into
     # map_features, so drop the per-worker duplicates from the state.
     return {"response": response, "map_features": map_features}
@@ -1061,9 +745,8 @@ async def synthesize_stream_node(state: AgentState):
     """Streaming twin of synthesize_node for SSE.
 
     Yields ('__token__', str) chunks as the LLM generates, then a final
-    ('result', dict) state update. If the provider fails mid-run the answer
-    is completed from the live-feed brief instead of leaving the user with
-    a dead stream.
+    ('result', dict) state update. Provider failures propagate to the API
+    layer and reach the user as an honest error — never a canned report.
     """
     if state.get("needs_location"):
         response = _clarification(state)
@@ -1074,22 +757,9 @@ async def synthesize_stream_node(state: AgentState):
     map_features = _merge_features(state)
     system, user = _prompt_for(state)
     response = ""
-    try:
-        async for token in chat_markdown_stream(system, user):
-            response += token
-            yield ("__token__", token)
-    except LLMError:
-        # Provider down (quota exhausted / outage): complete the answer from
-        # the feeds already gathered — never a fabricated report, only real
-        # observed/model values, and the brief says where it came from.
-        brief = _fallback_answer(state)
-        if response:
-            separator = "\n\n---\n\n"
-            yield ("__token__", separator + brief)
-            response = response + separator + brief
-        else:
-            yield ("__token__", brief)
-            response = brief
+    async for token in chat_markdown_stream(system, user):
+        response += token
+        yield ("__token__", token)
     yield "result", {"response": response, "map_features": map_features}
 
 
@@ -1097,7 +767,6 @@ async def synthesize_stream_node(state: AgentState):
 
 _STREAM_NODE_MAP = {
     "weather": weather_node,
-    "weather_lenient": weather_node_lenient,
     "geospatial": geospatial_node,
     "pfz": pfz_node,
     "advisory": advisory_node,
@@ -1185,18 +854,12 @@ async def run_chat_stream(
     async def _run(name: str):
         return name, await _STREAM_NODE_MAP[name](payload)
 
-    # One dead feed must not kill the answer: record the failure and answer
-    # from whichever feeds did respond (or say plainly that none did).
-    feed_errors: list[str] = []
+    # A failing worker fails the run: the exception propagates to the API
+    # layer, which reports it to the user as an honest operational error.
     for coro in asyncio.as_completed([_run(t) for t in tasks]):
-        try:
-            name, delta = await coro
-        except Exception as exc:  # WeatherUnavailable, DB down, timeout…
-            feed_errors.append(f"{type(exc).__name__}: {exc}")
-            continue
+        name, delta = await coro
         state.update(delta)
         yield _status(name)
-    state["feed_errors"] = feed_errors
 
     if state.get("needs_location"):
         # A marine question with no resolvable location. Answer by asking for

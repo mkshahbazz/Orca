@@ -6,7 +6,8 @@ OPENAI_API_KEY is available in this environment. Everything else is live:
 
   * place names are resolved through the real geocoder,
   * weather/marine numbers come from the real Open-Meteo feeds,
-  * the workspace's own fallback writer and prompt builders are exercised.
+  * the prompt builders and the honest-failure policy are exercised: a dead
+    AI provider must raise, never answer with canned text.
 
 The stub only replaces the two LLM entry points, and it records the exact
 context the real provider would have received, so the routing, the location
@@ -316,154 +317,80 @@ async def test_writer_input() -> None:
         ("CONFIDENCE", "confidence information"),
     ]:
         check(f"writer context carries {label}", needle in user)
-    # a failed feed must be reported to the writer instead of being hidden
-    err_state = dict(
-        message="Is it safe to fish near Chennai?",
-        intent="hazard_check",
-        coordinates={"lat": 13.088, "lon": 80.278},
-        location={"label": "Chennai", "scope": "point"},
-        feed_errors=["RuntimeError: DB pool not initialised"],
-    )
-    check("writer context carries feed failure reporting",
-          "FEED FAILURES" in agents._context(err_state))
     check("marine prompt is used for a marine question",
           WRITER_CALLS[-1]["system"] is agents.MARINE_SYS)
     check("conversation prompt is not used for a marine question",
           "ordinary conversation" not in WRITER_CALLS[-1]["system"])
 
 
-# ---------------------------------------------------------------- 5. fallback
-async def test_fallback_style() -> None:
-    print("\n== Writer-unavailable fallback style (Requirement 2) ==")
-    state = {
-        "message": "What is the weather in Chennai?",
-        "intent": "weather",
-        "coordinates": {"lat": 13.088, "lon": 80.278},
-        "location": {"label": "Chennai", "display_name": "Chennai, Tamil Nadu, India",
-                     "lat": 13.088, "lon": 80.278, "scope": "point"},
-        "weather_data": {
-            "lat": 13.088, "lon": 80.278, "source": "Open-Meteo (live)",
-            "wave_height_m": 1.8, "wave_direction_deg": 141, "wave_period_s": 8,
-            "sea_surface_temperature_c": 29.0, "wind_speed_kmh": 18,
-            "wind_gusts_kmh": 28, "air_temperature_c": 30, "weather": "Partly cloudy",
-            "forecast_days": [{"date": "2026-09-29", "wave_max_m": 1.2,
-                               "wind_max_kmh": 22, "gust_max_kmh": 34,
-                               "weather": "Partly cloudy", "rain_chance_pct": 40}],
-        },
-        "geospatial_data": {"checked": True, "zones": [], "geojson": None},
-        "advisory_data": {"matches": []},
-        "community_data": {"reports": [], "searched": True},
-        "feed_errors": [],
-    }
-    out = agents._fallback_answer(state)
-    print("\n--- fallback output (Chennai) ---\n" + out + "\n--- end ---\n")
-    check("states the location", "Chennai" in out)
-    check("interprets the waves instead of listing them",
-          "Waves are about 1.8 m" in out and "moderately rough" in out)
-    check("interprets the wind with its gusts",
-          "gusting to 28 km/h" in out)
-    check("no raw field dump", not re.search(r"^-\s+(Wind|Waves|Sky):", out, re.M))
-    check("carries a plain-language verdict", "Sea state:" in out)
-    check("hazard wording stays precise",
-          "not that the area is hazard-free" in out)
-
-    region = dict(state, message="What are the marine conditions in Odisha?",
-                  coordinates={"lat": 20.66, "lon": 87.4},
-                  location={"label": "Odisha", "display_name": "Odisha, India",
-                            "lat": 20.66, "lon": 87.4, "scope": "region",
-                            "representative": True,
-                            "source": "OpenStreetMap"},
-                  weather_data={**state["weather_data"], "lat": 20.66, "lon": 87.4})
-    out = agents._fallback_answer(region)
-    print("--- fallback output (Odisha) ---\n" + out + "\n--- end ---\n")
-    check("region scope is stated plainly", "representative point" in out)
-    check("region answer does not claim the whole area", "not for the whole area" in out)
-
-
-# ---------------------------------------------------------------- 6. outage
+# ---------------------------------------------------------------- 5. outage
 async def test_provider_outage() -> None:
-    """Router *and* writer unreachable — the path a key-less deployment takes.
+    """Writer unreachable — failures must reach the user, never canned text.
 
-    Both entry points raise, so the deterministic classifier and the live-feed
-    writer below it answer instead. The three requirements must still hold: a
-    greeting is a greeting, a named place is still that place, and a marine
-    question is never read as small talk.
+    With the writer down the run must RAISE (the API layer turns that into an
+    honest error event). The deterministic router heuristic still classifies
+    intent offline — that is routing, not fabricated content.
     """
-    print("\n== Router + writer unavailable (offline path) ==")
-
-    async def down_json(system: str, user: str) -> dict:
-        raise llm.LLMUnavailable("provider unreachable")
-
-    async def down_markdown(system: str, user: str) -> str:
-        raise llm.LLMUnavailable("provider unreachable")
+    print("\n== Writer unavailable -> honest failure, no canned answer ==")
 
     async def down_markdown_stream(system: str, user: str):
-        raise llm.LLMUnavailable("provider unreachable")
+        raise llm.LLMUnavailable("provider unreachable (simulated outage)")
         yield ""                                          # pragma: no cover
 
-    agents.chat_json = down_json
-    agents.chat_markdown = down_markdown
     agents.chat_markdown_stream = down_markdown_stream
     try:
+        raised = None
+        try:
+            await run("What is the weather in Chennai?")
+        except llm.LLMError as exc:
+            raised = exc
+        check("writer outage -> the error propagates (no canned report)",
+              raised is not None, "no exception was raised")
+
+        raised = None
+        try:
+            await run("Hello")
+        except llm.LLMError as exc:
+            raised = exc
+        check("conversation with writer down also fails honestly",
+              raised is not None, "no exception was raised")
+    finally:
+        agents.chat_markdown_stream = stub_chat_markdown_stream
+
+
+# ---------------------------------------------------- 6. router heuristic only
+async def test_router_heuristic() -> None:
+    """Router LLM unreachable: intent classification continues offline.
+
+    The heuristic decides only WHAT is being asked — the answer itself still
+    comes from the writer over live feeds. A down router must never invent
+    marine content: 'Hello' stays conversation (no feed touched) and a marine
+    question still reaches the live weather feed and the writer.
+    """
+    print("\n== Router offline: classification continues, no invented answers ==")
+
+    async def down_json(system: str, user: str) -> dict:
+        raise llm.LLMUnavailable("provider unreachable (simulated outage)")
+
+    agents.chat_json = down_json
+    try:
+        before = WEATHER_CALLS["n"]
         final = await run("Hello")
-        check("offline: 'Hello' is still conversation",
+        check("router down: 'Hello' is still conversation",
               final.get("intent") == "conversation", final.get("intent"))
-        check("offline: 'Hello' is not answered with a marine brief",
-              "Sea state" not in final.get("response", "")
-              and "live weather and sea-state feeds" not in final.get("response", ""),
-              final.get("response", "")[:90])
-        check("offline: 'Hello' gets a conversational reply",
-              "help" in final.get("response", "").lower(), final.get("response", "")[:90])
+        check("router down: no weather feed touched for 'Hello'",
+              WEATHER_CALLS["n"] == before, str(WEATHER_CALLS["n"] - before))
 
         final = await run("What is the weather in Chennai?")
-        check("offline: a named place is still resolved",
+        check("router down: 'What is the weather in Chennai?' still routes to weather",
+              final.get("intent") == "weather", final.get("intent"))
+        check("router down: Chennai still resolves via the geocoder",
               (final.get("location") or {}).get("label") == "Chennai",
               json.dumps(final.get("location"))[:90])
-        check("offline: the named place is not replaced by a word from the question",
-              (final.get("location") or {}).get("lat") == 13.084,
-              json.dumps(final.get("location"))[:90])
-        check("offline: the answer explains the conditions",
-              "Waves" in final.get("response", "") and "Sea state" in final.get("response", ""),
-              final.get("response", "")[:90])
-
-        final = await run("What are the weather conditions in Odisha?")
-        check("offline: Odisha is not West Bengal",
-              (final.get("location") or {}).get("label") == "Odisha",
-              json.dumps(final.get("location"))[:90])
-        check("offline: a region says where its sample point is",
-              "representative point" in final.get("response", ""),
-              final.get("response", "")[:90])
-
-        final = await run("What are the marine conditions in Kerala?")
-        check("offline: a marine question is not read as conversation",
-              final.get("intent") != "conversation", final.get("intent"))
-        check("offline: Kerala resolves to Kerala",
-              (final.get("location") or {}).get("label") == "Kerala",
-              json.dumps(final.get("location"))[:90])
-
-        chennai = await run("What is the weather in Chennai?")
-        follow = await run("Is the wind strong?", context={
-            "location": "Chennai", "lat": 13.084, "lon": 80.27,
-            "scope": "point", "representative": False,
-        })
-        check("offline: 'Is the wind strong?' keeps the earlier place",
-              (follow.get("location") or {}).get("label") == "Chennai",
-              json.dumps(follow.get("location"))[:90])
-        check("offline:  ... and answers with the wind, not a place called 'Strong'",
-              "Winds" in follow.get("response", ""), follow.get("response", "")[:90])
-        check("offline: the first Chennai answer used the same point",
-              (chennai.get("location") or {}).get("lat") == 13.084,
-              json.dumps(chennai.get("location"))[:90])
-
-        final = await run("Thanks!", context={
-            "location": "Chennai", "lat": 13.084, "lon": 80.27, "scope": "point",
-        })
-        check("offline: 'Thanks!' is conversation, not a new report",
-              final.get("intent") == "conversation", final.get("intent"))
+        check("router down: the live weather feed was still consulted",
+              WEATHER_CALLS["n"] > before, str(WEATHER_CALLS["n"] - before))
     finally:
         agents.chat_json = stub_chat_json
-        agents.chat_markdown = stub_chat_markdown
-        agents.chat_markdown_stream = stub_chat_markdown_stream
 
 
 async def test_location_floor() -> None:
@@ -503,9 +430,9 @@ async def main() -> int:
     await test_locations()
     await test_followups()
     await test_writer_input()
-    await test_fallback_style()
     await test_location_floor()
     await test_provider_outage()
+    await test_router_heuristic()
     await weather.shutdown()
 
     print(f"\n{'=' * 64}\n{len(PASS)} passed, {len(FAIL)} failed")
