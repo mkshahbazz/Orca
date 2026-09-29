@@ -1,24 +1,30 @@
 """Bhashini (Digital India / ULCA) translation wrapper.
 
-Two-step flow per Bhashini's public docs (dibd-bhashini.gitbook.io):
-  1. POST getModelsPipeline -> resolves a serviceId + inference endpoint + key
-     for a given (source, target) language pair. Cached in-memory since it
-     rarely changes for a fixed pipeline.
-  2. POST the resolved inference endpoint with the actual text -> translation.
+Two authentication paths, in priority order:
 
-Credentials: sign up at https://bhashini.gov.in, verify email, then generate
-userId + ulcaApiKey from your profile page. Free, self-serve.
+  1. Direct inference key (BHASHINI_INFERENCE_KEY) — POSTs straight to
+     Dhruva's pipeline inference endpoint with the key as the Authorization
+     header. No discovery round-trip, works with a pre-issued key alone.
+  2. ULCA pipeline resolution (BHASHINI_USER_ID + BHASHINI_API_KEY) — the
+     classic getModelsPipeline flow that resolves a serviceId + callback per
+     language pair; results are cached in-memory.
 
-A pre-issued inference key (BHASHINI_INFERENCE_KEY) can also be supplied; it is
-used directly when the pipeline-config step cannot be reached, so translation
-keeps working even if only the inference credential is available.
+Failure policy: translation is a *promised* part of the answer when the user
+picked a language, so failures are NEVER masked by silently returning the
+English text. `translate()` raises BhashiniError with the status code and
+response body, logged at ERROR with full technical detail; the API layer
+turns that into an honest, descriptive error for the user.
 
-Fails soft: any error returns the original text untouched so a translation
-outage never breaks the chat itself.
+Credentials: the inference key comes from https://bhashini.gov.in (Dhruva).
+The ULCA pair is issued alongside it (profile page: userId + ulcaApiKey).
 """
+import logging
+
 import httpx
 
 from app.config import settings
+
+log = logging.getLogger("marine.bhashini")
 
 CONFIG_URL = "https://meity-auth.ulcacontrib.org/ulca/apis/v0/model/getModelsPipeline"
 # Standard Bhashini (Dhruva) pipeline inference endpoint used with a static key.
@@ -35,16 +41,20 @@ SUPPORTED_LANGUAGES = {
 _config_cache: dict[tuple[str, str], dict] = {}
 
 
+class BhashiniError(RuntimeError):
+    """Translation failed — authentication, network, quota or bad payload."""
+
+
 def is_configured() -> bool:
-    """True when translation credentials are present (pipeline or static key)."""
+    """True when any translation credential is present."""
     return bool(
-        (settings.bhashini_user_id and settings.bhashini_api_key)
-        or settings.bhashini_inference_key
+        settings.bhashini_inference_key
+        or (settings.bhashini_user_id and settings.bhashini_api_key)
     )
 
 
-def _static_inference_config() -> dict:
-    """Fallback config built from a pre-issued inference key (no serviceId needed)."""
+def _static_config() -> dict:
+    """Direct-inference config built from the pre-issued key."""
     return {
         "service_id": None,
         "callback_url": INFERENCE_URL,
@@ -53,15 +63,25 @@ def _static_inference_config() -> dict:
 
 
 async def _get_pipeline_config(client: httpx.AsyncClient, source: str, target: str) -> dict:
+    """Resolve the inference endpoint for a language pair.
+
+    With an inference key configured this goes straight to Dhruva — the
+    discovery round-trip needs a userID that may not accompany a static key.
+    """
     key = (source, target)
     if key in _config_cache:
         return _config_cache[key]
 
+    if settings.bhashini_inference_key:
+        cfg = _static_config()
+        _config_cache[key] = cfg
+        return cfg
+
     if not (settings.bhashini_user_id and settings.bhashini_api_key):
-        # Only a static inference key is available — skip the resolve step.
-        if settings.bhashini_inference_key:
-            return _static_inference_config()
-        raise RuntimeError("Bhashini credentials are not configured")
+        raise BhashiniError(
+            "Bhashini credentials are not configured on the server "
+            "(set BHASHINI_INFERENCE_KEY, or BHASHINI_USER_ID + BHASHINI_API_KEY)."
+        )
 
     try:
         resp = await client.post(
@@ -90,21 +110,29 @@ async def _get_pipeline_config(client: httpx.AsyncClient, source: str, target: s
         resolved = {"service_id": service_id, "callback_url": callback_url, "auth_header": auth_header}
         _config_cache[key] = resolved
         return resolved
-    except Exception:
-        if settings.bhashini_inference_key:
-            return _static_inference_config()
-        raise
+    except Exception as exc:
+        raise BhashiniError(
+            f"could not resolve the Bhashini pipeline for {source}->{target}: {exc}"
+        ) from exc
 
 
 async def translate(text: str, source: str, target: str) -> str:
-    """Translate `text` from `source` to `target` (ISO-639 codes). Soft-fails to original text."""
+    """Translate `text` from `source` to `target` (ISO-639 codes).
+
+    Raises BhashiniError on any failure — the caller decides how to surface
+    it. We never silently return the untranslated text: a user who asked for
+    Hindi must not receive English and not be told.
+    """
     if not text.strip() or source == target:
         return text
     if not is_configured():
-        return text  # not configured — no-op rather than error
+        raise BhashiniError(
+            "translation was requested but Bhashini credentials are not configured "
+            "on the server (BHASHINI_INFERENCE_KEY missing)."
+        )
 
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=20) as client:
             cfg = await _get_pipeline_config(client, source, target)
             task_config: dict = {
                 "language": {"sourceLanguage": source, "targetLanguage": target},
@@ -119,8 +147,31 @@ async def translate(text: str, source: str, target: str) -> str:
                     "inputData": {"input": [{"source": text}]},
                 },
             )
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                body = resp.text[:500]
+                log.error(
+                    "Bhashini inference failed: status=%s source=%s target=%s chars=%d body=%s",
+                    resp.status_code, source, target, len(text), body,
+                )
+                raise BhashiniError(
+                    f"Bhashini inference replied {resp.status_code}: {body}"
+                )
             out = resp.json()
-            return out["pipelineResponse"][0]["output"][0]["target"]
-    except Exception:
-        return text  # degrade gracefully — chat still works in English
+            try:
+                return out["pipelineResponse"][0]["output"][0]["target"]
+            except (KeyError, IndexError, TypeError) as exc:
+                log.error(
+                    "Bhashini reply had an unexpected shape: %s | payload=%s",
+                    exc, str(out)[:500],
+                )
+                raise BhashiniError(
+                    f"Bhashini reply could not be parsed: {exc}"
+                ) from exc
+    except BhashiniError:
+        raise
+    except Exception as exc:
+        log.error(
+            "Bhashini translation call failed: source=%s target=%s chars=%d error=%r",
+            source, target, len(text), exc,
+        )
+        raise BhashiniError(f"translation service unreachable: {exc}") from exc

@@ -182,7 +182,16 @@ def _friendly_error(exc: Exception) -> str:
     if isinstance(exc, llm.LLMNotConfigured):
         return "The AI service is not configured on the server, so no answer could be generated."
     if isinstance(exc, llm.LLMError):
-        return "The AI service is temporarily unavailable (the model request failed). Please try again."
+        detail = str(exc)[:220]
+        return (
+            "The AI service is temporarily unavailable (the model request "
+            f"failed). {detail} Please try again later."
+        )
+    if isinstance(exc, bhashini.BhashiniError):
+        return (
+            "Translation failed, so your question could not be answered in the "
+            f"requested language. Technical detail: {exc}"
+        )
     if isinstance(exc, weather.WeatherUnavailable):
         return f"Live marine weather and sea-state data are temporarily unavailable. {exc}"
     if "DATABASE" in str(exc).upper() or "database_url" in str(exc).lower():

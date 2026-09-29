@@ -347,8 +347,9 @@ export function MonkChat({ open, onClose }: { open: boolean; onClose: () => void
               work — in any of twelve languages.
             </p>
             <small>
-              Every answer states its sources and a confidence self-assessment. When the AI writer
-              is unavailable the Monk still briefs you straight from the live feeds.
+              Every answer states its sources and a confidence self-assessment.
+              When a feed or the AI writer is unavailable, the Monk says so
+              plainly instead of inventing an answer.
             </small>
           </div>
         ) : (
