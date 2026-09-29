@@ -35,9 +35,10 @@ from supabase import create_client
 
 from app import llm
 from app.agents import STATUS_LABELS, run_chat_stream
+from app.community_api import router as community_router
 from app.config import settings
 from app.dashboard import router as dashboard_router
-from app.services import bhashini, geospatial, weather
+from app.services import bhashini, geospatial, gemini, storage, weather
 
 log = logging.getLogger("marine")
 
@@ -66,11 +67,20 @@ async def lifespan(app: FastAPI):
         log.warning("DB pool init failed: %s", exc)
     await weather.startup()                       # shared httpx client
 
-    # AI provider: confirm the credential is present before building the client.
+    # AI providers: OpenAI is primary, Gemini is the in-process fallback. Both
+    # are validated before any request is served, and a missing key is logged
+    # rather than silently degrading a later answer.
     if llm.startup():
-        log.info("AI provider client initialised (model=%s)", llm.CHAT_MODEL)
+        log.info(
+            "AI providers ready (primary=%s, model=%s, gemini_models=%s)",
+            llm.provider_status()["primary"], llm.CHAT_MODEL,
+            ",".join(settings.gemini_models()) if llm.gemini_configured() else "none",
+        )
     else:
-        log.error("OPENAI_API_KEY is missing — /api/chat will report the AI service as unavailable")
+        log.error(
+            "No AI provider configured (OPENAI_API_KEY and GEMINI_API_KEY both empty) — "
+            "/api/chat will report the AI service as unavailable"
+        )
 
     if _init_supabase():
         log.info("Supabase logging client initialised")
@@ -80,17 +90,24 @@ async def lifespan(app: FastAPI):
     if not bhashini.is_configured():
         log.warning("Bhashini translation not configured — answers will stay in English")
 
+    if storage.is_configured():
+        log.info("Community media storage ready (bucket=%s)", storage.bucket())
+    else:
+        log.warning("Supabase Storage not configured — community media uploads are disabled")
+
     yield
 
     for task in list(_background_tasks):          # don't kill pending logs mid-write
         task.cancel()
     llm.shutdown()
+    await gemini.shutdown()
     await weather.shutdown()
     await geospatial.close_pool()
 
 
 app = FastAPI(title="Marine Geospatial Safety & Fishing Advisory", lifespan=lifespan)
-app.include_router(dashboard_router)  # additive read-only dashboard endpoints
+app.include_router(dashboard_router)   # additive read-only dashboard endpoints
+app.include_router(community_router)   # fisher contributions + contributor trust
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins.split(","),
@@ -181,6 +198,12 @@ def _friendly_error(exc: Exception) -> str:
     """Turn an internal exception into an honest, user-facing explanation."""
     if isinstance(exc, llm.LLMNotConfigured):
         return "The AI service is not configured on the server, so no answer could be generated."
+    if isinstance(exc, llm.LLMProvidersExhausted):
+        # Both providers were tried, in order, and both failed: say so plainly.
+        return (
+            "The AI service is temporarily unavailable — both the primary (OpenAI) and "
+            f"fallback (Gemini) models failed. {str(exc)[:300]}"
+        )
     if isinstance(exc, llm.LLMError):
         detail = str(exc)[:220]
         return (
@@ -192,6 +215,8 @@ def _friendly_error(exc: Exception) -> str:
             "Translation failed, so your question could not be answered in the "
             f"requested language. Technical detail: {exc}"
         )
+    if isinstance(exc, storage.StorageError):
+        return str(exc)
     if isinstance(exc, weather.WeatherUnavailable):
         return f"Live marine weather and sea-state data are temporarily unavailable. {exc}"
     if "DATABASE" in str(exc).upper() or "database_url" in str(exc).lower():
@@ -226,12 +251,17 @@ async def health():
         db = await geospatial.ping()
     except Exception:
         db = False
+    providers = llm.provider_status()
     return {
         "status": "ok" if (db and llm.is_configured()) else "degraded",
         "database": db,
         "llm_configured": llm.is_configured(),
+        # which providers exist, and which one served the last request
+        "llm": providers,
+        "gemini_configured": providers["gemini"],
         "translation_configured": bhashini.is_configured(),
         "community_reports": db,
+        "community_media_storage": storage.is_configured(),
     }
 
 

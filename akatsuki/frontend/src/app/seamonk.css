@@ -958,3 +958,57 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
   .gw-halo, .gw-scrollhint, .dx-live-dot::after { animation: none; }
   .gw-bg { transition: none; }
 }
+
+/* ============================================================================
+   Confidence meter (.cm-*)
+   ----------------------------------------------------------------------------
+   Shared by the dashboard Monk window and the landing gateway chat: one
+   component, one visual language. The score comes from the backend confidence
+   engine for that exact answer — nothing here computes or hardcodes it.
+   ========================================================================= */
+.cm-meter {
+  display: block;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: rgba(9, 26, 45, .55);
+  font-size: 11px;
+}
+.cm-meter-row { display: flex; align-items: center; gap: 8px; }
+.cm-meter-track {
+  flex: 1 1 auto;
+  height: 4px;
+  min-width: 46px;
+  border-radius: 2px;
+  background: rgba(70, 130, 195, .2);
+  overflow: hidden;
+}
+.cm-meter-track i { display: block; height: 100%; background: currentColor; transition: width .5s ease; }
+.cm-meter-score { font-family: var(--font-data, monospace); font-size: 12.5px; letter-spacing: .01em; }
+.cm-meter-word { color: var(--dim); text-transform: lowercase; white-space: nowrap; }
+.cm-meter[data-label="high"] { color: #57e3a3; }
+.cm-meter[data-label="moderate"] { color: #f0c25c; }
+.cm-meter[data-label="low"] { color: #ff9a9a; }
+.cm-meter-why {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+.cm-meter-more { margin-top: 6px; }
+.cm-meter-more > summary {
+  cursor: pointer;
+  color: var(--dim);
+  font-size: 10px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  list-style: none;
+}
+.cm-meter-more > summary::-webkit-details-marker { display: none; }
+.cm-meter-more > summary::before { content: "+ "; }
+.cm-meter-more[open] > summary::before { content: "– "; }
+.cm-meter-more ul { margin: 6px 0 0; padding-left: 16px; color: var(--muted); font-size: 10.5px; }
+.cm-meter-more li { margin: 2px 0; }
+.cm-meter-note { margin: 6px 0 0; color: var(--dim); font-size: 10px; line-height: 1.5; }
+@media (max-width: 520px) { .cm-hide-narrow { display: none; } }

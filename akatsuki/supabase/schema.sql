@@ -78,11 +78,18 @@ create table if not exists public.community_reports (
     created_at        timestamptz not null default now(),
     observed_at       timestamptz not null default now(),   -- when it happened
     category          text not null check (category in (
+                          -- Contribute page choices
+                          'catch','hazard','sea_condition','fishing_zone',
+                          'weather_observation','other',
+                          -- sensor-corroborated hazard categories
                           'heavy_swell','high_wave','rough_seas','high_wind',
                           'squall','thunderstorm','storm','strong_current',
-                          'debris','oil_spill','shoal','fish_sighting','other')),
+                          'debris','oil_spill','shoal','fish_sighting')),
     description       text not null,                        -- what was seen
     reporter_role     text,                                 -- fisherman, coast_guard…
+    reporter_name     text,                                 -- feeds trust/badges
+    media_url         text,                                 -- Supabase Storage URL
+    media_type        text check (media_type is null or media_type in ('image','video')),
     lat               double precision not null,
     lon               double precision not null,
     location          geometry(Point, 4326) not null,       -- where (X=lon, Y=lat)
@@ -90,10 +97,31 @@ create table if not exists public.community_reports (
     verification_note text,
     verification_source text
 );
+-- Upgrading an existing project instead? Run
+--   supabase/migrations/001_community_contribution.sql
+-- which adds the same columns, categories, indexes and storage bucket in place.
 create index if not exists community_reports_geom_idx
     on public.community_reports using gist (location);
 create index if not exists community_reports_observed_at_idx
     on public.community_reports (observed_at desc);
+create index if not exists community_reports_reporter_idx
+    on public.community_reports (reporter_name);
+create index if not exists community_reports_verified_idx
+    on public.community_reports (verified, observed_at desc);
+create index if not exists community_reports_category_idx
+    on public.community_reports (category, observed_at desc);
+
+-- Storage bucket for contributed photos/video (public read, server-side write).
+insert into storage.buckets (id, name, public)
+values ('community-media', 'community-media', true)
+on conflict (id) do update set public = true;
+update storage.buckets
+   set file_size_limit = 20971520,
+       allowed_mime_types = array[
+         'image/jpeg','image/png','image/webp','image/heic','image/heif',
+         'video/mp4','video/quicktime','video/webm','video/3gpp','video/x-matroska'
+       ]
+ where id = 'community-media';
 
 -- Keep `location` in sync with the lat/lon pair on every insert.
 create or replace function public.sync_community_location()

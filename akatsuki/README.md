@@ -3,6 +3,19 @@
 Extracted from your coding agent's full scaffold (schema + backend + frontend).
 Full source dump is in the uploaded Akatsuki.txt if you need to cross-check anything.
 
+## 0. Upgrading an existing project (community contributions)
+If the database already exists, run the additive migration once — it extends
+`community_reports` in place (reporter name, media URL/type, six fisher-facing
+categories, indexes) and creates the public `community-media` Storage bucket:
+
+```
+supabase/migrations/001_community_contribution.sql   -- SQL Editor → Run
+```
+
+It is `if not exists` throughout, so running it twice is harmless. Without it,
+`/api/community/*` reports the missing migration by name instead of failing
+mysteriously.
+
 ## 1. Supabase (dashboard, not terminal)
 Create project → SQL Editor → paste `supabase/schema.sql` → Run. Verify:
 ```sql
@@ -17,7 +30,7 @@ select count(*) from community_reports;               -- 2 (crowdsourced tips)
 cd backend
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env          # fill OPENAI_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DATABASE_URL
+cp .env.example .env          # fill OPENAI_API_KEY, GEMINI_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DATABASE_URL
                               # (optional) set BHASHINI_INFERENCE_KEY for regional-language replies
 python -m app.scripts.seed_embeddings    # "Done — embedded 5 advisory row(s)."
 uvicorn app.main:app --reload --port 8000
@@ -72,6 +85,57 @@ Translation is two-way: a regional-language question is translated to English
 before display. The UI shows live backend milestones (`Translating question…`,
 `Checking weather buoys…`, `Writing safety report…`) instead of a frozen spinner.
 
+## 6. Community contributions (the Contribute page)
+
+`/dashboard/contribute` is the fisher-facing half of the platform. A report has
+a photo/clip, a category, a description and a position, and lands in the
+**existing** `community_reports` table — there is no second store.
+
+```bash
+py scripts/check_community.py          # offline rules: matrix, trust, confidence
+py scripts/check_community.py --live   # + probes the deployed API
+```
+
+* **Categories**: catch, hazard, sea/ocean condition, fishing-zone condition,
+  weather observation, other (the original hazard categories still verify).
+* **Verification** runs the moment a report lands: waves/swell/period for sea
+  state and hazard claims, wind gusts and storm codes for weather claims, and a
+  PostGIS/shapely containment test against the live INCOIS PFZ bulletin for
+  catch and fishing-zone claims. `other` is never auto-verified.
+* **Confidence**: only verified reports count (+12 each, capped at +18) — exactly
+  as before. The factors line now says whether each was sensor- or
+  PFZ-corroborated.
+* **Media** goes to the public `community-media` Supabase Storage bucket,
+  uploaded *through* the API with the service-role key. The key never reaches
+  the browser; a 20 MB cap and an image/video type check are enforced server-side.
+* **Recognition** is derived from verified counts only:
+  `trust = 70% × (verified ÷ reports) + 30% × min(verified, 10) ÷ 10`, with
+  badges New Contributor → Trusted Fisher → Verified Observer → Community Expert.
+
+## 7. LLM providers: OpenAI primary, Gemini fallback
+
+`app/llm.py` is the only module the agents call. Each call tries OpenAI first
+and, on any failure (quota, exhausted credits, outage, auth), retries the *same*
+request on Gemini via `app/services/gemini.py` — in-process, with no second agent
+graph and no duplicate classification:
+
+```
+router / synthesizer -> llm.chat_json | chat_markdown | chat_markdown_stream
+                          OpenAI ──ok──> answer
+                             └──fail──> Gemini ──ok──> answer
+                                            └──fail──> honest service error
+```
+
+* Keys stay server-side: `OPENAI_API_KEY`, `GEMINI_API_KEY`. Neither is ever
+  sent to the frontend or committed.
+* If OpenAI is not configured at all, Gemini simply serves the request.
+* Streaming only falls back *before* the first token — a half-finished answer is
+  reported as broken rather than silently restarted.
+* If both fail, the UI gets a real error naming both providers. No weather, PFZ,
+  hazard or fishing text is ever fabricated to fill the gap.
+* `GET /health` reports `llm.primary`, `gemini_configured` and which provider
+  served the last request.
+
 ## Two things most likely to bite you
 1. **pgvector codec**: `pgvector.asyncpg.register_vector(conn)` must run on every connection before
    any `::vector` query, or asyncpg throws "no codec for type vector".
@@ -79,4 +143,5 @@ before display. The UI shows live backend milestones (`Translating question…`,
    #1 bug risk in `check_hazard_zone`.
 
 Notes: RLS is disabled on the tables for local dev — add policies before any production auth.
-The only hard external dependency for `/api/chat` is your OpenAI key.
+`/api/chat` needs at least one of `OPENAI_API_KEY` / `GEMINI_API_KEY`, and the
+`community-media` bucket must be public-read for contributed photos to render.

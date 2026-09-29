@@ -531,6 +531,12 @@ export type CommunityReport = {
   observedAt: string;
   verified: boolean;
   verificationNote: string;
+  /** True when this row came from the live community store rather than the
+   *  demonstration set — the map and lists label the difference. */
+  live?: boolean;
+  mediaUrl?: string | null;
+  mediaType?: "image" | "video" | null;
+  reporterName?: string | null;
 };
 
 export const COMMUNITY: CommunityReport[] = [

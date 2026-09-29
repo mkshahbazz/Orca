@@ -30,7 +30,7 @@ from typing import Any, AsyncIterator, TypedDict
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from app.llm import chat_json, chat_markdown, chat_markdown_stream
+from app.llm import LLMUnavailable, chat_json, chat_markdown, chat_markdown_stream
 from app.services import advisory, community, confidence, geospatial, incois, location, weather
 
 # ---------------------------------------------------------------- state
@@ -505,14 +505,21 @@ async def verify_node(state: AgentState) -> dict:
     """Verification matrix + confidence scoring.
 
     Human tips are cross-referenced with the physical sensor readings gathered
-    by the parallel workers; only sensor-corroborated reports are allowed to
-    lift the final confidence score. Ordinary conversation gathers no evidence,
-    so it carries no confidence badge at all.
+    by the parallel workers (waves/wind/storm) and, for catch and fishing-zone
+    claims, with the live INCOIS PFZ bulletin. Only sensor- or satellite-
+    corroborated reports are allowed to lift the final confidence score;
+    unverified reports are still reported to the UI, but never raise it.
+    Ordinary conversation gathers no evidence, so it carries no confidence
+    badge at all.
     """
     if state.get("conversation"):
         return {"confidence": None}
     cd = state.get("community_data") or {}
-    reports = community.verify_reports(cd.get("reports") or [], state.get("weather_data"))
+    # Fishing-claim categories are corroborated against the live PFZ bulletin,
+    # so the verification helper fetches it only when a report needs it.
+    reports = await community.verify_reports_for_point(
+        cd.get("reports") or [], state.get("weather_data")
+    )
     verified = [r for r in reports if r.get("verified")]
     scored = confidence.score_answer(state, verified_reports=verified)
     return {
@@ -736,6 +743,9 @@ async def synthesize_node(state: AgentState) -> dict:
     map_features = _merge_features(state)
     system, user = _prompt_for(state)
     response = await chat_markdown(system, user)
+    if not response.strip():
+        # An empty completion is a provider failure, not an answer.
+        raise LLMUnavailable("The AI provider returned an empty answer.")
     # Trimmed payload: the big geojson blobs are already merged into
     # map_features, so drop the per-worker duplicates from the state.
     return {"response": response, "map_features": map_features}
@@ -760,6 +770,9 @@ async def synthesize_stream_node(state: AgentState):
     async for token in chat_markdown_stream(system, user):
         response += token
         yield ("__token__", token)
+    if not response.strip():
+        # Nothing was generated at all: report it rather than showing blank text.
+        raise LLMUnavailable("The AI provider returned an empty answer.")
     yield "result", {"response": response, "map_features": map_features}
 
 

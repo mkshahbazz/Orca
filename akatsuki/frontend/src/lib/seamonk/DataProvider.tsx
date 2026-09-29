@@ -36,16 +36,19 @@ import {
   monthlyAggregate,
   sampleField,
   series,
+  type CommunityReport,
   type Conditions,
   type Hazard,
   type PfzZone,
   type Point,
   type RegionId,
 } from "./demo";
+import { API_URL } from "./api";
 import { LAYERS, type LayerKey } from "./design";
 import { distanceNm, kmhToKt } from "./format";
 
-export const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Re-exported for the modules that already import it from here.
+export { API_URL };
 
 export type DataMode = "live" | "degraded" | "demo";
 
@@ -79,6 +82,13 @@ export type SeaState = {
   refreshing: boolean;
   refresh: () => void;
   apiError: string | null;
+  /**
+   * Community reports the rest of the console should show. When the backend
+   * answers, this is the **live** community store (verified + unverified); when
+   * it does not, it is the labelled demonstration set — never a mix, and never
+   * live-looking data invented locally.
+   */
+  communityLive: boolean;
 
   region: Region;
   setRegionId: (id: RegionId) => void;
@@ -141,6 +151,42 @@ export function useMounted(): boolean {
   return m;
 }
 
+/** One row from `/api/community/reports` -> the console's report shape. */
+type CommunityApiRow = {
+  id: string | number;
+  category: string;
+  description: string;
+  reporter_name?: string | null;
+  reporter_role?: string | null;
+  lat: number;
+  lon: number;
+  observed_at?: string | null;
+  verified?: boolean;
+  verification_note?: string | null;
+  media_url?: string | null;
+  media_type?: "image" | "video" | null;
+};
+
+function mapCommunityRows(rows: CommunityApiRow[]): CommunityReport[] {
+  return rows
+    .filter((r) => Number.isFinite(r.lat) && Number.isFinite(r.lon))
+    .map((r) => ({
+      id: `live-${r.id}`,
+      category: r.category,
+      description: r.description,
+      reporterRole: r.reporter_name || r.reporter_role || "Contributor",
+      reporterName: r.reporter_name ?? null,
+      lat: r.lat,
+      lon: r.lon,
+      observedAt: r.observed_at ?? new Date().toISOString(),
+      verified: !!r.verified,
+      verificationNote: r.verification_note || "No verification note recorded.",
+      mediaUrl: r.media_url ?? null,
+      mediaType: r.media_type ?? null,
+      live: true,
+    }));
+}
+
 function trendFromApi(rows: { hour: string; sst: number }[] | undefined, day: number): Point[] {
   if (!rows?.length) return [];
   return rows.map((r) => {
@@ -162,6 +208,7 @@ export function SeamonkDataProvider({ children }: { children: React.ReactNode })
   const [systems, setSystems] = useState<SystemsRow[]>([]);
   const [apiSnapshot, setApiSnapshot] = useState<ApiSnapshot | null>(null);
   const [apiGrid, setApiGrid] = useState<Record<string, { lat: number; lon: number; v: number }[]> | null>(null);
+  const [liveCommunity, setLiveCommunity] = useState<CommunityReport[] | null>(null);
   const [windows, setWindows] = useState(() => ({ now: 0, day: 0, week: 0, month: 0, year: 0 }));
 
   // Time windows are computed after mount so the prerendered HTML and the
@@ -227,6 +274,19 @@ export function SeamonkDataProvider({ children }: { children: React.ReactNode })
       setApiGrid(null);
     }
 
+    // Community contributions: the fisher-facing half of the platform. Shown on
+    // every map with their real verification verdict, so a verified report from
+    // one boat is visible to the next one.
+    try {
+      const res = await fetch(`${API_URL}/api/community/reports?limit=40`, { cache: "no-store" });
+      if (res.ok) {
+        const data = await res.json();
+        setLiveCommunity(mapCommunityRows(data.reports ?? []));
+      }
+    } catch {
+      /* keep the previous list; mode already reflects unreachability */
+    }
+
     if (ok) {
       const degraded = fetchedSystems.some((s) => s.status !== "active");
       setMode(degraded ? "degraded" : "live");
@@ -256,6 +316,10 @@ export function SeamonkDataProvider({ children }: { children: React.ReactNode })
     () => COASTAL_REGIONS.find((r) => r.id === regionId) ?? COASTAL_REGIONS[0],
     [regionId]
   );
+
+  // Live contributions win outright once the store has answered — including an
+  // empty answer, which is a real result and must not be padded with demo rows.
+  const community = liveCommunity ?? COMMUNITY;
 
   const conditions = useMemo<Conditions>(() => {
     const c = apiSnapshot?.conditions;
@@ -401,6 +465,7 @@ export function SeamonkDataProvider({ children }: { children: React.ReactNode })
     refreshing,
     refresh: () => load(false),
     apiError,
+    communityLive: liveCommunity !== null,
 
     region,
     setRegionId,
@@ -420,7 +485,7 @@ export function SeamonkDataProvider({ children }: { children: React.ReactNode })
     observations: OBSERVATIONS,
     sources: SOURCES,
     reports: REPORTS,
-    community: COMMUNITY,
+    community,
     readings: READINGS,
     systems,
     gridFor,

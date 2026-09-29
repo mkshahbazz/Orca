@@ -11,13 +11,14 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_URL } from "@/lib/seamonk/api";
+import { ConfidenceMeter, type Confidence } from "./ConfidenceMeter";
 
 export type MonkMessage = {
   role: "user" | "assistant";
   content: string;
-  confidence?: { score: number; label: "high" | "moderate" | "low"; justification: string } | null;
+  /** Reliability of this specific answer, as scored by the backend engine. */
+  confidence?: Confidence | null;
   error?: boolean;
   mode?: "ai" | "feeds";
 };
@@ -358,16 +359,7 @@ export function MonkChat({ open, onClose }: { open: boolean; onClose: () => void
               {m.role === "assistant" ? (
                 <>
                   <MonkMarkdown text={m.content} />
-                  {m.confidence ? (
-                    <span
-                      className="sk-monk-conf"
-                      data-label={m.confidence.label}
-                      title={m.confidence.justification}
-                    >
-                      <i aria-hidden />
-                      {m.confidence.score}% confidence · {m.confidence.label}
-                    </span>
-                  ) : null}
+                  <ConfidenceMeter confidence={m.confidence} compact />
                 </>
               ) : (
                 m.content

@@ -3368,3 +3368,94 @@ body {
     display: none !important;
   }
 }
+
+/* ============================================================================
+   Contribute (community contributions) — .cn-*
+   ----------------------------------------------------------------------------
+   Built from the same tokens and primitives as the rest of the console: no new
+   palette, no new radius scale, no card shadows. The one deliberate departure
+   is size — the upload target, the category tiles and the submit button are
+   larger than a desktop-dashboard norm, because the person using this page is
+   often on a phone, on a boat, in sunlight.
+   ========================================================================= */
+.cn-drop {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  text-align: center;
+  padding: 24px 18px;
+  border: 1.5px dashed var(--line-2);
+  border-radius: var(--r-md);
+  background: rgba(9, 26, 45, .5);
+  color: var(--cyan);
+  cursor: pointer;
+  transition: border-color .18s ease, background .18s ease;
+}
+.cn-drop:hover, .cn-drop:focus-visible { border-color: var(--cyan); background: rgba(51, 185, 242, .06); }
+.cn-drop.is-dragging { border-color: var(--cyan); background: rgba(51, 185, 242, .1); }
+.cn-drop.is-error { border-color: var(--danger-line); color: var(--danger-fg); }
+.cn-drop b { color: var(--text); font-size: 13.5px; }
+.cn-drop span { color: var(--dim); font-size: 11.5px; max-width: 470px; line-height: 1.5; }
+.cn-preview { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.cn-preview img, .cn-preview video {
+  width: 100%;
+  max-height: 250px;
+  object-fit: cover;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line-hair);
+  background: var(--ink-2);
+}
+
+.cn-cats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+@media (max-width: 700px) { .cn-cats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.cn-cat {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 11px;
+  border: 1px solid var(--line-hair);
+  border-radius: var(--r-sm);
+  background: var(--ink-2);
+  color: var(--muted);
+  text-align: left;
+  transition: border-color .15s ease, color .15s ease, background .15s ease;
+}
+.cn-cat b { font-size: 12px; font-weight: 600; }
+.cn-cat:hover { border-color: var(--line-2); color: var(--text); }
+.cn-cat.is-active {
+  border-color: var(--cyan);
+  background: var(--cyan-soft);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px rgba(51, 185, 242, .25);
+}
+.cn-cat-ico { font-size: 17px; line-height: 1; }
+
+.cn-map { margin-top: 12px; border-radius: var(--r-sm); overflow: hidden; border: 1px solid var(--line-hair); }
+
+.cn-trust { font-family: var(--font-data); font-size: 30px; font-weight: 600; line-height: 1; color: var(--cyan); }
+
+.cn-person { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--line-soft); }
+.cn-person:last-child { border-bottom: 0; }
+.cn-person-ico { font-size: 17px; }
+.cn-person b { font-size: 12.5px; color: var(--text); }
+
+.cn-feed { max-height: 560px; overflow-y: auto; }
+.cn-item { padding: 12px 13px; border-bottom: 1px solid var(--line-soft); }
+.cn-item:last-child { border-bottom: 0; }
+.cn-item-head { display: flex; align-items: center; gap: 8px; }
+.cn-item-head b { font-size: 12.5px; }
+.cn-item > p { margin: 7px 0 0; font-size: 12px; line-height: 1.5; color: var(--muted); }
+.cn-thumb { margin-top: 8px; }
+.cn-thumb img, .cn-thumb video {
+  width: 100%;
+  max-height: 170px;
+  object-fit: cover;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line-hair);
+  background: var(--ink-2);
+}
+.cn-item-foot { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.cn-note { font-style: italic; color: var(--dim) !important; font-size: 11px !important; }
+
+.cn-flow { margin: 8px 0 0; padding-left: 18px; display: grid; gap: 6px; font-size: 12px; line-height: 1.5; color: var(--muted); }

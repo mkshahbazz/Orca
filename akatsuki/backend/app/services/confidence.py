@@ -110,7 +110,21 @@ def score_answer(
     if verified_reports:
         bonus = min(18, 12 * len(verified_reports))
         score += bonus
-        factors.append(f"{len(verified_reports)} verified community report(s)")
+        # Distinguish how each report was corroborated so the "why" line is
+        # precise: live sensors for wave/wind/storm claims, the satellite PFZ
+        # bulletin for catch and fishing-zone claims.
+        pfz_backed = sum(
+            1 for r in verified_reports
+            if "PFZ" in str(r.get("verification_source") or "")
+            or str(r.get("verification_source") or "").lower().startswith("incois")
+        )
+        sensor_backed = len(verified_reports) - pfz_backed
+        labels = []
+        if sensor_backed:
+            labels.append(f"{sensor_backed} sensor-corroborated community report(s)")
+        if pfz_backed:
+            labels.append(f"{pfz_backed} PFZ-corroborated community report(s)")
+        factors.append(" + ".join(labels))
 
     # ---- policy caps (applied before floors so thresholds stay honest) ----
     if not coords:
@@ -167,7 +181,10 @@ def _justification(
         if geo_checked:
             parts.append("an authoritative spatial hazard-boundary check")
         if verified:
-            parts.append(f"{verified} community report(s) corroborated by live sensor data")
+            parts.append(
+                f"{verified} community report(s) corroborated by live sensors or the "
+                "satellite PFZ bulletin"
+            )
         return " and ".join(parts) + "."
 
     if weather_state == "cached":
@@ -204,8 +221,8 @@ def _justification(
     if verified:
         return (
             f"Located from an explicit position and corroborated by {verified} "
-            "community report(s) verified against live sensor data, but full spatial "
-            "confirmation was incomplete."
+            "community report(s) checked against live sensor or PFZ data, but full "
+            "spatial confirmation was incomplete."
         )
 
     if zones:

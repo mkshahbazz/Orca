@@ -20,6 +20,7 @@ import {
   Bell,
   ChevronDown,
   Close,
+  Community,
   Database,
   FishingZones,
   Globe,
@@ -48,13 +49,14 @@ export type NavItem = {
   count?: number;
 };
 
-export function navItems(counts: { zones: number; reports: number }): NavItem[] {
+export function navItems(counts: { zones: number; reports: number; community: number }): NavItem[] {
   return [
     { href: "/dashboard/", label: "Ocean Watch", icon: OceanWatch },
     { href: "/dashboard/fishing-zones/", label: "Fishing Zones", icon: FishingZones, count: counts.zones },
     { href: "/dashboard/voyage-safety/", label: "Voyage Safety", icon: VoyageSafety },
     { href: "/dashboard/analytics/", label: "Marine Analytics", icon: MarineAnalytics },
     { href: "/dashboard/map-layers/", label: "Map Layers", icon: MapLayers },
+    { href: "/dashboard/contribute/", label: "Contribute", icon: Community, count: counts.community },
     { href: "/dashboard/reports/", label: "Reports", icon: Reports, count: counts.reports },
     { href: "/dashboard/settings/", label: "Settings", icon: Settings },
   ];
@@ -100,6 +102,8 @@ export function Shell({ children }: { children: ReactNode }) {
   const items = navItems({
     zones: sea.pfz.filter((z) => z.probability >= 65).length,
     reports: sea.reports.filter((r) => r.status === "ready").length,
+    // verified community contributions carried by the live store
+    community: sea.community.filter((c) => c.verified).length,
   });
   const current = items.find((i) => i.href === path) ?? items[0];
 

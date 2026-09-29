@@ -376,6 +376,25 @@ export const Bell = (p: SeamonkIconProps) => (
   </Svg>
 );
 
+/** Fisher community — two figures and a quay line, for contributions. */
+export const Community = (p: SeamonkIconProps) => (
+  <Svg {...p}>
+    <circle cx="9.2" cy="7.6" r="2.9" />
+    <path d="M3.6 20.2c0-3.1 2.5-5.4 5.6-5.4s5.6 2.3 5.6 5.4" />
+    <path d="M16.4 5.4a2.7 2.7 0 0 1 0 5.3" />
+    <path d="M17.6 14.4c2.1.6 3.5 2.5 3.5 4.7" />
+  </Svg>
+);
+
+/** Attach a photo or clip — an arrow entering the frame. */
+export const Upload = (p: SeamonkIconProps) => (
+  <Svg {...p}>
+    <path d="M4 15.4v3.2A2.4 2.4 0 0 0 6.4 21h11.2a2.4 2.4 0 0 0 2.4-2.4v-3.2" />
+    <path d="M12 16V3.6" />
+    <path d="M7.6 8l4.4-4.4L16.4 8" />
+  </Svg>
+);
+
 export const Crosshair = (p: SeamonkIconProps) => (
   <Svg {...p}>
     <circle cx="12" cy="12" r="7.4" />

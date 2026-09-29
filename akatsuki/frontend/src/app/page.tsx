@@ -11,6 +11,8 @@ import {
   Waves,
 } from "lucide-react";
 import "./seamonk.css";
+import { ConfidenceMeter, type Confidence } from "@/components/seamonk/ConfidenceMeter";
+import { API_URL } from "@/lib/seamonk/api";
 import { SmoothScroll } from "@/components/hero/SmoothScroll";
 import { createHeroSignal } from "@/components/hero/signal";
 
@@ -38,9 +40,6 @@ const GATEWAY_QUESTIONS = [
   "Show today's marine forecast",
 ];
 
-/** Backend base URL — the same marine intelligence service the dashboard uses. */
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-
 /** Mirrors backend services/bhashini.py SUPPORTED_LANGUAGES. */
 const LANGS: Record<string, string> = {
   en: "EN",
@@ -61,7 +60,8 @@ type ChatMsg = {
   role: "user" | "assistant";
   content: string;
   error?: boolean;
-  confidence?: { score: number; label: string; justification: string } | null;
+  /** Reliability of this answer, scored by the backend confidence engine. */
+  confidence?: Confidence | null;
 };
 
 const HeroScene = dynamic(() => import("@/components/hero/HeroScene"), {
@@ -507,13 +507,8 @@ export default function SeamonkLanding() {
                     className={`gw-chat-msg ${m.role}${m.error ? " is-error" : ""}`}
                   >
                     {m.content}
-                    {m.role === "assistant" && m.confidence ? (
-                      <span
-                        className="gw-chat-conf"
-                        title={m.confidence.justification}
-                      >
-                        {m.confidence.score}% confidence · {m.confidence.label}
-                      </span>
+                    {m.role === "assistant" ? (
+                      <ConfidenceMeter confidence={m.confidence} compact />
                     ) : null}
                   </div>
                 ))
