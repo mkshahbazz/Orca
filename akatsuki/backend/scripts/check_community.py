@@ -203,6 +203,18 @@ def check_confidence() -> None:
           "partial" in partial["justification"].lower() or "part of" in partial["justification"].lower(),
           partial["justification"])
 
+    # The justification must name the actual gap, not a generic "low".
+    live_only = confidence.score_answer(
+        {"coordinates": {"lat": 21.0, "lon": 87.5}, "weather_data": ROUGH}, verified_reports=[]
+    )
+    why = live_only["justification"]
+    check("a moderate score does not claim confidence is low",
+          "low" not in why.lower(), why)
+    check("the justification names the missing spatial check",
+          "spatial" in why.lower(), why)
+    check("the justification does not claim live readings were unavailable",
+          "unavailable" not in why.lower(), why)
+
     guess = confidence.score_answer({}, verified_reports=[])
     check("an evidence-free answer cannot claim high confidence", guess["score"] <= 28, str(guess["score"]))
     # a stored/verified claim may not be passed in as if it were sensor evidence

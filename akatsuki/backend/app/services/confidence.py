@@ -242,10 +242,29 @@ def _justification(
             "spatial confirmation was incomplete."
         )
 
+    # Below the high band with a named position in hand. Each remaining branch
+    # states the *specific* gap, so the score never reads as a vague brush-off:
+    # "no spatial check" and "no independent corroboration" are different things.
     if zones:
-        return "Confidence is limited because verification relied on partial evidence for this location."
+        return (
+            "A recorded hazard affects this position, so the conditions reading alone "
+            "cannot make this a confident answer."
+        )
+
+    if not geo_checked and weather_state == "live":
+        return (
+            "Live sensor readings were used for the position you named, but no spatial "
+            "hazard-boundary check was completed, so this stops short of full verification."
+        )
+
+    if not geo_checked:
+        return (
+            "The position you named was used, but neither live sensor readings nor a "
+            "spatial hazard-boundary check could be completed for it."
+        )
 
     return (
-        "Confidence is low because live sensor readings and spatial boundary checks "
-        "were unavailable for this location."
+        "Live sensor readings and a spatial hazard-boundary check were completed for this "
+        "position, but nothing independently corroborated them, so this stops short of "
+        "full verification."
     )
