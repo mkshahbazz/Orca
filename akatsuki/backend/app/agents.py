@@ -76,7 +76,12 @@ LOCATION_INTENTS = ("weather", "hazard_check")
 TASK_MAP = {
     "conversation": [],
     "weather":        ["weather", "community"],
-    "pfz_search":     ["pfz", "advisory", "community"],
+    # `weather` is included here even though a zone list does not need it: the
+    # community verification matrix cross-checks every human report against a
+    # live reading, so without it a catch report near a queried fishing ground
+    # could never be corroborated — and a corroborated report is exactly what
+    # should raise confidence for the next fisher asking the same question.
+    "pfz_search":     ["pfz", "advisory", "weather", "community"],
     "hazard_check":   ["geospatial", "weather", "advisory", "community"],
     "general_advisory": ["advisory"],
 }
